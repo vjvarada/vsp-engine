@@ -862,44 +862,77 @@ Frontend polls `/api/jobs/{task_id}` every 1 second with TanStack Query `refetch
 
 ## 8. Workflow Patterns Learned
 
-### 8.1 The 3D Slicer Segmentation Workflow (Industry Standard)
+### 8.1 The Scout → Select → AI → Refine → Export Workflow (VSP Engine's Core Innovation)
+
+The key insight from surveying ct2print, brain2print, SlicerTotalSegmentator, and the 5-tier segmentation research: **the surgeon needs fast anatomical feedback first, then AI acts on a small focused crop, not the whole volume.**
+
+**Why not AI-first?** Running TotalSegmentator on a full 512×512×800 CT when the surgeon only needs one femur wastes 80–90% of GPU resources, adds 3–5 minutes of wait, and gives the surgeon 117 labeled structures they'll never use. The UX is a long spinner → overwhelming results.
+
+**Why not threshold-only?** HU threshold gives one undifferentiated bone blob — you can't select "just the left mandible" from it. But split into connected components it becomes a perfect interactive picker.
+
+**The Scout pattern:**
+1. Fast threshold → MeshLib connected components → per-island PLY meshes (5–10 s, no GPU)
+2. Surgeon clicks islands of interest in R3F → system auto-computes tight ROI bounding box
+3. AI runs only on the cropped volume → 10–58× faster, more accurate, less GPU memory
+4. AI labels **replace** the rough scout islands — surgeon sees named anatomy immediately
 
 ```
-LOAD → VIEW → SEGMENT → EDIT → MEASURE → EXPORT
-  ↑        ↑       ↑        ↑       ↑          ↑
-Upload   NiiVue  TotalSeg  Brush  Ruler      STL/OBJ
+LOAD → SCOUT → SELECT → AI FOCUS → REFINE → MESH → EXPORT
+  ↑       ↑        ↑        ↑           ↑       ↑       ↑
+NiiVue  MeshLib  R3F     TotalSeg    SAM-Med3D  MeshLib  STL
+ 2-5s   5-10s   0s      5-120s       ~2s/click  5-15s
 ```
 
-VSP Engine maps this to workflow steps directly:
-| 3D Slicer Step | VSP Step | Panel Content |
+VSP Engine workflow steps vs 3D Slicer:
+| 3D Slicer Step | VSP Step | Key Difference |
 |---|---|---|
-| Add Data | 1. Upload | Drag-drop zone, DICOM metadata preview |
-| Volume Render | 2. Volume View | NiiVue canvas, HU windowing controls |
-| TotalSegmentator | 3. Segment | AI task selector, fast/HD toggle, progress bar |
-| Segment Editor | 4. Review | Per-bone visibility, opacity, show/hide all |
-| Markup ROI | 5. Crop / ROI | R3F bounding box gizmo (Drei Box + TransformControls) |
-| Export | 6. Export | STL download with watermark, print settings |
+| Add Data | 1. Upload (2–5 s) | NiiVue renders CT immediately during NIfTI conversion |
+| Volume Render | 2. Scout (5–10 s) | MeshLib threshold → colored connected-component bone islands appear automatically |
+| Markup ROI | 3. Select / ROI (0 s) | Click islands to select; ROI auto-computed; drag gizmo to adjust |
+| TotalSegmentator | 4. AI Segment (5–120 s) | Runs on ROI crop only; task auto-picked from scout island hints |
+| Segment Editor | 5. Refine (optional) | SAM-Med3D 3D click OR MedSAM 2D box for corrections |
+| Export | 6. Mesh + Export | MeshLib (Pass B) + watertight check + STL download |
 
-### 8.2 Segmentation Overlay UX (from brain2print)
+### 8.2 Scout UX — Connected Components as Clickable Anatomy Picker
 
-After AI segmentation completes:
-1. Color each bone segment differently (use a medical colormap)
-2. Show as semi-transparent overlay on the CT volume in NiiVue
-3. Allow toggling each label on/off in the sidebar
-4. Click on bone in 3D view → highlight in sidebar list (bidirectional selection)
+The scout islands behave like a 3D version of a checkbox list. Implementation:
 
-Pattern: Load the multilabel NIfTI output (`--ml` flag) as a NiiVue overlay volume with opacity 0.5.
+```typescript
+// R3F — each island is a separate mesh with raycasting
+islands.forEach((island, i) => (
+  <mesh
+    key={island.id}
+    geometry={island.bufferGeometry}
+    material={isSelected(island.id) ? selectedMaterial : islands[i % 20].material}
+    onClick={(e) => { e.stopPropagation(); toggleIsland(island.id) }}
+    onPointerEnter={() => setHovered(island.id)}
+  />
+))
+// Sidebar: sorted by voxel_count desc, checkbox + size label per island
+```
 
-### 8.3 Mesh Preview Before Download (from ct2print)
+Backend returns per-island metadata so the UI can show "Island 3: ~12,400 voxels (likely femur)" before the surgeon has clicked anything.
 
-ct2print shows the mesh interactively in the same NiiVue canvas before the user downloads STL.
+### 8.3 Segmentation Overlay UX — Scout → AI Label Replacement
 
-In VSP Engine: Use React Three Fiber for the mesh preview (separate from NiiVue):
-- NiiVue → volume/segmentation overlay view
-- R3F Canvas → final 3D mesh preview with orbit controls, zoom, pan
-- User can switch between views
+Phase progression for the R3F viewport:
+1. **Scout phase:** rough per-island colored meshes (semitransparent, 50% opacity)
+2. **AI running:** scout islands remain visible (surgeon can still see anatomy while waiting); progress bar in status strip
+3. **AI complete:** scout islands FADE OUT; per-label AI meshes FADE IN with named anatomy colors
+4. **Refine phase:** AI meshes are still interactive; shift-click opens SAM-Med3D point prompt
+5. **Mesh phase:** all labels replaced by final export-quality mesh
 
-### 8.4 Model Download on First Run
+NiiVue runs in parallel throughout: CT volume always visible; multilabel NIfTI overlay added when AI completes (opacity 0.5, colormap="warm").
+
+### 8.4 Dual Viewport Coordination
+
+VSP Engine uses two rendering contexts in the same viewport region:
+- **NiiVue (WebGL2, DOM canvas):** CT volume + MPR slices + label overlay — always behind
+- **R3F Canvas (Three.js, WebGL):** 3D bone islands/meshes + ROI gizmo + interaction — overlaid via CSS `position: absolute; pointer-events: none` except for interactive elements
+
+Key: `nv.onLocationChange` fires on crosshair movement → update corresponding highlight in R3F. Clicking R3F mesh → set NiiVue crosshair to that anatomical location (bidirectional link).
+
+### 8.5 Model Download on First Run
 
 SlicerTotalSegmentator and TotalSegmentator both auto-download weights on first run.
 
@@ -907,7 +940,7 @@ SlicerTotalSegmentator and TotalSegmentator both auto-download weights on first 
 1. Docker build runs `totalseg_download_weights -t total` → bakes weights into the image or volume
 2. Startup health check: verify weights exist → set `segmentation_ready: true` in Redis
 3. Frontend shows "AI models loading..." overlay if `segmentation_ready: false`
-4. Only show the Segment step after `segmentation_ready: true`
+4. Scout (Phase 2) works without AI weights — surgeon can still see scout mesh before AI is ready
 
 ---
 

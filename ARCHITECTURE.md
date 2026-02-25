@@ -12,9 +12,11 @@
 A browser-based clinical tool that:
 
 1. **Ingests** DICOM CT / MR studies (or NIfTI / NRRD equivalents)
-2. **Segments** bone (and soft-tissue regions of interest) automatically using AI
-3. **Lets the surgeon refine** the segmentation and crop the exact volume to print
-4. **Exports** a watertight, print-ready STL / OBJ mesh — correctly scaled, shelled, and repaired
+2. **Scouts** immediately — a fast HU-threshold pass produces per-bone connected-component islands the surgeon can click (<10 s, no GPU needed)
+3. **Focuses** — the surgeon selects the anatomy they need; the system auto-computes a tight ROI crop
+4. **Segments accurately** — AI (TotalSegmentator) runs only on the small ROI crop (10–58× faster, more accurate, less GPU memory)
+5. **Refines interactively** — surgeon can fix any mislabeled region with a single 3D click (SAM-Med3D-turbo) or 2D bounding box (MedSAM)
+6. **Exports** a watertight, print-ready STL / OBJ mesh — correctly scaled, repaired, and annotated
 
 The interface must be operable by a non-technical user (surgeon, radiographer). Zero command-line interaction.
 
@@ -188,16 +190,21 @@ All panels use `tech-glass` (backdrop-blur + semi-transparent border + bg-backgr
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-### VSP Engine workflow steps (replacing Fixture steps)
+### VSP Engine workflow steps — Scout → Select → AI → Refine → Export
 
-| Icon | Step            | Replaces Fixture Step | Content                                                    |
-| ---- | --------------- | --------------------- | ---------------------------------------------------------- |
-| 🔼   | **Upload**      | Import                | DICOM drag-drop zone, series browser, NIfTI status         |
-| 🧩   | **Volume View** | _(new)_               | NiiVue windowing, MPR axes, brightness/contrast/WL         |
-| 🎯   | **Segment**     | Supports              | Run AI button, structure checkboxes, mask overlay colors   |
-| ✂️   | **Crop / ROI**  | Baseplates            | 3D bounding box gizmo + XYZ numeric inputs                 |
-| ⚙️   | **Mesh**        | Cavity                | Quality, shell thickness, simplification sliders           |
-| 💾   | **Export**      | Export                | STL/OBJ/3MF format, scale selector, watertight check badge |
+The workflow is designed so the surgeon sees *something* in under 10 seconds and always has interactive control before any slow AI job runs.
+
+| Icon | Step            | Time      | What Happens                                                                                                    |
+| ---- | --------------- | --------- | --------------------------------------------------------------------------------------------------------------- |
+| 📥   | **Upload**      | 2–5 s     | DICOM drag-drop → dcm2niix NIfTI conversion in background; NiiVue starts rendering raw CT immediately            |
+| 🔍   | **Scout**       | 5–10 s    | MeshLib HU threshold (~300 HU) → connected-component islands → per-island colored 3D mesh overlaid in R3F; surgeon can visually inspect all bone anatomy at once  |
+| 🎯   | **Select**      | 0 s       | Surgeon **clicks bone islands** in the 3D view to select anatomy of interest; OR draws a manual 3D bounding box; system auto-computes tight ROI AABB with 10% padding |
+| 🤖   | **AI Segment**  | 5–120 s   | TotalSegmentator runs on **cropped ROI volume only** → per-bone NIfTI labels; colored labels replace rough threshold islands; sidebar shows named anatomy checklist |
+| ✏️   | **Refine**      | 2 s/click | Optional: surgeon clicks a misclassified region → SAM-Med3D-turbo 3D point → corrected mask; OR draws 2D bbox on MPR → MedSAM slice refinement |
+| ⚙️   | **Mesh**        | 5–15 s    | MeshLib on selected AI masks → repair → simplify; quality/thickness/hollow sliders; watertight badge            |
+| 💾   | **Export**      | instant   | Select which bones to include → STL/OBJ/3MF download with planning watermark                                    |
+
+> **Why Scout first?** The threshold mesh gives the surgeon an immediate 3D anatomical map of the scan — they know exactly which bone island to click for AI to focus on. AI then runs on a crop 5–20× smaller than the full volume: faster (5–30 s vs 60–300 s), more accurate (no out-of-ROI confusion), and uses far less GPU memory. The rough mesh is a *navigation proxy*, not the final output.
 
 ### CSS design tokens reused verbatim from RapidTool-Fixture
 
@@ -225,108 +232,286 @@ All panels use `tech-glass` (backdrop-blur + semi-transparent border + bg-backgr
 
 ---
 
-## 6. Data Flow
+## 6. Data Flow — Scout → Select → AI → Refine → Export
 
 ```
-DICOM Series (ZIP / folder drag-drop)
+── PHASE 1: LOAD ──────────────────────────────────────── ~2–5 s ──
+
+CLIENT:  DICOM ZIP drag-drop
+         dcmjs → group by SeriesInstanceUID → series thumbnail grid
+         User picks CT series → upload to /upload
+
+BACKEND /upload:
+         pydicom → strip PHI (name, DOB, MRN, StudyID)
+         SimpleITK / dcm2niix → NIfTI (.nii.gz)
+         Store: MinIO study/{id}/volume.nii.gz
+         Return: {study_id, dims, spacing, HU_min, HU_max, nifti_url}
+
+CLIENT:  NiiVue attaches to canvas, loads volume URL
+         → CT renders immediately; surgeon sees the scan
 
 
-1. CLIENT: dcmjs groups into series, previews thumbnails
+── PHASE 2: SCOUT ─────────────────────────────────────── ~5–10 s ──
+
+BACKEND /scout (fast Celery task, Tier 1):
+         MeshLib: VoxelsLoad.loadDicomsFolderTreeAsVdb()
+                  OR SimpleGrid from NIfTI voxel array
+         marchingCubesFloat(vdb, iso=300)           ← bone HU ~300
+         removeSmallComponents(mesh, minVol=50)      ← remove noise
+         findConnectedComponents(mesh)               ← per-island IDs
+         Each island → separate .ply blob + centroid + AABB
+         Return: [{island_id, centroid_xyz, aabb, ply_url, voxel_count}, …]
+
+CLIENT:  R3F loads each island PLY as a separate <mesh>
+         Color per island (medical colormap, 20 colors cycling)
+         Hover → highlight + show voxel_count tooltip
+         Click island → toggle selected (yellow glow)
+         Sidebar lists islands sorted by size with checkboxes
 
 
-2. BACKEND /upload: pydicom validates + SimpleITK converts  NIfTI
+── PHASE 3: SELECT / ROI ──────────────────────────────── ~0 s ───
+
+CLIENT:  Surgeon selects ≥1 islands (click in R3F or sidebar checkbox)
+         System: union of selected island AABBs → tight crop bbox
+                 + 10% padding each axis → proposed ROI box
+         ROI box shown as Drei <TransformControls> gizmo (adjustable)
+         Numeric XYZ fields in context panel for precise entry
+         "Confirm ROI" button → lock crop, show crop preview in NiiVue
 
 
-3. BACKEND /segment (async Celery job):
-      TotalSegmentator  NIfTI label masks (per-bone class)
-      MONAI (optional refinement)
+── PHASE 4: AI SEGMENT ────────────────────────────────── 5–120 s ──
+
+BACKEND /segment (Celery task, Tier 2):
+         Crop NIfTI to ROI: SimpleITK.RegionOfInterest(nifti, roi_box)
+         totalsegmentator(
+           cropped_volume,
+           task=auto_pick_task(roi_labels_hint),  ← total / craniofacial / teeth
+           roi_subset=suggested_label_names,
+           fast=False,
+           device="gpu"
+         )
+         → multilabel NIfTI (each integer = one bone class)
+         Store: study/{id}/seg_{task}.nii.gz
+         self.update_state(PROGRESS, percent=…, step="segmenting")
+
+CLIENT:  SSE progress → status bar updates
+         On complete: NiiVue adds seg NIfTI as overlay (opacity=0.5, colormap="warm")
+         Scout island meshes REPLACED by AI-labeled colored meshes in R3F
+         Sidebar: named anatomy checklist (e.g. femur_left ✓, vertebra_L3 ✓)
+         Each label has show/hide eye icon + color swatch
 
 
-4. CLIENT: polling /jobs/{id}  receive mask NIfTI URLs
-      NiiVue loads original + mask overlay  colored segmentation view
+── PHASE 5: INTERACTIVE REFINE ──────────────────────────── optional ──
+
+CLIENT (Tier 3 — SAM-Med3D):
+         Surgeon shift-clicks a voxel in R3F viewport
+         → RayCast → world (x,y,z) → voxel (z,y,x) passed to backend
+         /refine/point: SAM-Med3D-turbo medim.create_model() → binary mask
+         New mask overlaid; surgeon accepts or dismisses
+
+CLIENT (Tier 4 — MedSAM):
+         Surgeon draws 2D bbox on NiiVue MPR slice
+         nv.onLocationChange gives slice index + image coords
+         /refine/bbox: MedSAM per-slice → stack across z → 3D volume
+         Useful for implants, hardware, rare pathology
 
 
-5. SURGEON: select structures, adjust ROI bounding box in 3D,
-            optionally draw freehand corrections on slices
+── PHASE 6: MESH ─────────────────────────────────────────── 5–15 s ──
+
+BACKEND /mesh/generate:
+         For each selected label:
+           binary_mask = extract_label(seg_nifti, label_id)
+           scipy.ndimage.binary_closing(mask, iterations=2)  ← fill gaps
+           SimpleGrid → MeshLib marchingCubesFloat(iso=0.5)
+           mr.fixSelfIntersections(mesh)
+           mr.fillHoles(mesh)
+           mr.removeSmallComponents(mesh, 100)
+           mr.relaxMesh(mesh)                                ← smooth
+           mr.decimateMesh(mesh, maxError=0.2)               ← simplify
+         Boolean union of all selected labels → combined mesh
+         mr.boolean(mesh, roi_box_mesh, BooleanOperation.Intersection)
+         assert topology.isClosed()                          ← REQUIRED
+         Export: study/{id}/mesh_{timestamp}.stl
+
+CLIENT:  STLLoader → R3F mesh preview (replace scout clouds)
+         Orbit / pan / zoom; per-label color; show/hide toggles
 
 
-6. BACKEND /mesh/generate (Celery):
-      MeshLib: load voxel mask  marching cubes
-              morphology close  heal mesh  simplify
-              boolean intersect with ROI box
-              offset-shell for wall thickness
-              make watertight
+── PHASE 7: EXPORT ───────────────────────────────────────── instant ──
 
-
-7. CLIENT: loads STL  R3F mesh preview  surgeon inspects
-
-
-8. BACKEND /mesh/export: scaled STL / OBJ / 3MF download
+CLIENT:  Select format (STL / OBJ / 3MF), scale (1:1 / ×2 / ×0.5)
+         "FOR PLANNING PURPOSES ONLY" watermark embedded in metadata
+         Download via signed MinIO URL
 ```
 
 ---
 
-## 7. AI Segmentation Strategy
+## 7. AI Segmentation Strategy — Scout → Select → Focus → Refine
 
-### Primary: TotalSegmentator
+### Design Principle: AI Runs Last, On the Smallest Possible Volume
 
-- Install: `pip install TotalSegmentator`
-- Python API:
-  ```python
-  from totalsegmentator.python_api import totalsegmentator
-  output_nifti = totalsegmentator(input_nifti, task="total")
-  # For appendicular bones (requires license):
-  output_nifti = totalsegmentator(input_nifti, task="appendicular_bones")
-  # For craniofacial:
-  output_nifti = totalsegmentator(input_nifti, task="craniofacial_structures")
-  ```
-- Bone classes available in `total` task: skull, all vertebrae (C1–L5 + sacrum), ribs (1–12 bilateral), sternum, humerus, scapula, clavicula, femur, hip (pelvis), costal cartilages
-- GPU: RTX 3090 ~60s for full-body 1.5mm. CPU with `--fast` flag ~8 min.
+Running TotalSegmentator on a full 512×512×800 CT when the surgeon only needs one femur wastes 80–90% of GPU time and increases error risk (structures outside ROI cause label confusion). The workflow front-loads a cheap threshold pass that lets the surgeon define the ROI *before* AI starts.
 
-### Secondary: MONAI Model Zoo
+```
+ROI crop ratio examples:
+  Full chest CT (512×512×600)  → femur ROI (200×200×300) = 9.8% of volume  → 10× faster AI
+  Full head CT  (512×512×400)  → mandible ROI (250×200×150) = 7.2% of volume → 14× faster AI
+  Full spine    (512×512×800)  → L4-L5 ROI (150×150×100) = 1.7% of volume  → 58× faster AI
+```
 
-- Used for anatomy where TotalSegmentator has lower accuracy or for MR input
-- Bundle system: `monai.bundle.download(name="wholeBody_ct_segmentation")`
-- Custom fine-tuning pipeline for hospital-specific data via MONAI's training workflows
+### Phase 2 — Scout (MeshLib HU Threshold + Connected Components)
 
-### Threshold Fallback
+```python
+import meshlib.mrmeshpy as mr
 
-- For quick previews: Hounsfield Unit-based threshold (bone ~400 HU) using scipy/skimage before AI finishes
-- Marching cubes directly on thresholded NIfTI fast approximate mesh for immediate surgeon feedback
+# Fast path: load NIfTI voxels into MeshLib
+vox = mr.loadVoxels("volume.nii.gz")                 # or fromSimpleGrid()
+mesh = mr.marchingCubesFloat(vox.data, mr.MarchingCubesParams(300.0))  # HU 300
+mr.removeSmallComponents(mesh, 50)                   # remove sub-50-voxel noise
+
+# Split into connected components for per-island UX
+components = mr.getAllComponents(mesh)               # returns list[Mesh]
+# Each component → PLY blob → return to frontend for 3D display
+for i, comp in enumerate(components):
+    mr.saveMesh(comp, f"island_{i}.ply")
+```
+
+### Phase 4 — AI Segment (TotalSegmentator on Cropped Volume)
+
+```python
+import SimpleITK as sitk
+from totalsegmentator.python_api import totalsegmentator
+
+# Crop to ROI (surgeon-confirmed bounding box)
+img = sitk.ReadImage("volume.nii.gz")
+physical_origin = roi_min_xyz          # world coords from R3F gizmo
+physical_size   = roi_max_xyz - roi_min_xyz
+resampler = sitk.RegionOfInterestImageFilter()
+resampler.SetRegionOfInterest(start_index, size_voxels)
+cropped = resampler.Execute(img)
+sitk.WriteImage(cropped, "cropped.nii.gz")
+
+# Auto-pick task from ROI hint labels
+task = pick_task(hint_labels)         # "total" / "craniofacial_structures" / "teeth"
+output = totalsegmentator(
+    "cropped.nii.gz",
+    task=task,
+    roi_subset=hint_label_names,      # skip classes outside this ROI
+    fast=False,
+    device="gpu",
+    ml=True,                          # multilabel NIfTI output
+)
+```
+
+**Task auto-selection logic:**
+| Scout island centroids suggest… | → task |
+|---|---|
+| skull / mandible / maxilla region | `craniofacial_structures` |
+| individual tooth crowns | `teeth` (FDI notation, CVPR 2025) |
+| vertebrae column | `total` with `roi_subset=["vertebrae_*"]` |
+| femur / tibia / fibula | `total` with `roi_subset=["femur", "tibia", "fibula"]` |
+| full body or unknown | `total` (all 117 classes) |
+
+### Phase 5 — Interactive Refinement
+
+**Tier 3 — SAM-Med3D-turbo (3D point, ~2 s):**
+```python
+import medim, torch
+model = medim.create_model("SAM-Med3D", pretrained=True)  # downloads turbo ckpt
+# point from R3F shift-click → (z, y, x) voxel order
+point = torch.tensor([[[z_norm, y_norm, x_norm]]])         # normalized [0,1]
+label = torch.tensor([[1]])                                 # 1=positive
+with torch.no_grad():
+    mask = model(image_patch_tensor, point, label)          # (1,1,D,H,W)
+```
+
+**Tier 4 — MedSAM (2D box, ~0.5 s/slice):**
+```python
+# box from NiiVue slice interaction → bbox [x1, y1, x2, y2] + slice_idx
+# MedSAM inference per slice → stack along z → 3D mask volume
+from segment_anything import sam_model_registry
+sam = sam_model_registry["vit_b"](checkpoint="medsam_vit_b.pth").eval()
+# ... run per-slice, concatenate → final 3D mask
+```
+
+### Task Routing Summary
+
+| Scenario | Tier | Tool | GPU | Time |
+|---|---|---|---|---|
+| Bone overview, rough print | 1 | MeshLib HU threshold | No | <5 s |
+| Standard CT bone (known anatomy) | 2 | TotalSegmentator on ROI crop | Yes | 5–60 s |
+| Unknown structure / rare pathology | 3 | SAM-Med3D-turbo 3D click | Yes | ~2 s |
+| Implant / hardware / 2D box natural | 4 | MedSAM bbox on slice | No/Yes | ~1 s |
+| Hospital has custom annotated data | 5 | STU-Net-B fine-tuned | Yes | offline train |
 
 ---
 
 ## 8. Mesh Processing Pipeline (MeshLib)
 
+Two mesh processing passes at different quality levels:
+
+### Pass A — Scout Mesh (fast, rough, interactive)
 ```python
 import meshlib.mrmeshpy as mr
 
-# 1. Load voxel mask (binary NIfTI  SimpleGrid)
-vox = mr.loadVoxels("bone_mask.nrrd")
+# From NIfTI voxels or DICOM folder:
+vox = mr.loadVoxels("volume.nii.gz")
+mesh = mr.marchingCubesFloat(vox.data, mr.MarchingCubesParams(300.0))  # HU 300
+mr.removeSmallComponents(mesh, minVolumeVerts=50)   # remove tiny noise islands
+components = mr.getAllComponents(mesh)              # split into islands
+# Each component → .ply → client for interactive clicking
+# Runtime: ~5–10 s on CPU. No GPU needed.
+```
 
-# 2. Marching cubes  mesh
-mesh = mr.gridToMesh(vox, isoValue=0.5)
+### Pass B — Final Export Mesh (accurate, watertight, print-ready)
+```python
+import meshlib.mrmeshpy as mr
 
-# 3. Heal mesh (fill holes, remove self-intersections)
-mr.fixSelfIntersections(mesh)
-mr.fillHoles(mesh)
+# 1. Load binary mask from AI label (one per selected bone)
+vox = mr.loadVoxels("label_femur_left.nii.gz")
 
-# 4. Smooth
-mr.relax(mesh, MeshRelaxParams())
+# 2. Marching cubes on binary mask
+mesh = mr.marchingCubesFloat(vox.data, mr.MarchingCubesParams(0.5))
 
-# 5. Simplify (to ~50k faces for web preview)
-mr.decimate(mesh, DecimateSettings(maxError=0.3))
+# 3. Heal: MUST run in this order
+mr.fixSelfIntersections(mesh)          # removes bad triangles
+mr.fillHoles(mesh)                     # closes open boundaries
+mr.removeSmallComponents(mesh, 100)    # cull noise fragments
 
-# 6. Boolean intersect with ROI box
-roi_mesh = mr.makeBox(mr.Box3f(min_pt, max_pt))
-result = mr.boolean(mesh, roi_mesh, mr.BooleanOperation.Intersection)
+# 4. Smooth (light — preserve anatomy detail)
+params = mr.MeshRelaxParams()
+params.iterations = 3
+mr.relax(mesh, params)
 
-# 7. Shell offset for wall thickness (for hollow surgical guides)
-shelled = mr.offsetMesh(result, offset=1.5)  # 1.5mm wall
+# 5. Simplify (50k faces = good web preview; 200k = print quality)
+da = mr.DecimateSettings()
+da.maxError = 0.2
+mr.decimateMesh(mesh, da)
 
-# 8. Export
+# 6. Boolean intersect with ROI box (clean crop boundary)
+box = mr.makeCube(mr.Box3f(
+    mr.Vector3f(*roi_min_mm),
+    mr.Vector3f(*roi_max_mm)
+))
+result = mr.boolean(mesh, box, mr.BooleanOperation.Intersection).mesh
+
+# 7. Optional: shell for hollow surgical guide models
+# shelled = mr.offsetMesh(result, 1.5)   ← 1.5mm wall
+
+# 8. REQUIRED: assert watertight before export
+assert result.topology.isClosed(), "Mesh not watertight — refuse STL export"
+
+# 9. Export
 mr.saveMesh(result, "output.stl")
 ```
+
+### Mesh Quality Tiers Exposed in UI
+
+| UI Setting    | decimateMesh maxError | Target faces  | Use case                          |
+|---------------|-----------------------|---------------|-----------------------------------|
+| Preview       | 0.5 mm                | ~30k          | Fast R3F viewport preview         |
+| Standard      | 0.2 mm                | ~100–200k     | General 3D printing               |
+| High Detail   | 0.05 mm               | ~500k+        | Surgical accuracy, fine features  |
 
 ---
 
@@ -339,21 +524,27 @@ vsp-engine/
        app/                  # App shell, routing
        components/
           viewport/         # R3F Canvas, NiiVue integration
-             VolumeViewer.tsx
-             MeshViewer.tsx
-             ROIBox.tsx    # Drei TransformControls crop box
-             MPRSlices.tsx
+             VolumeViewer.tsx       # NiiVue WebGL2 canvas wrapper
+             ScoutViewer.tsx        # R3F: per-island threshold meshes (clickable)
+             ROIBox.tsx             # Drei TransformControls crop box
+             AILabelViewer.tsx      # R3F: per-label AI mesh overlays
+             MeshViewer.tsx         # R3F: final export-quality mesh
+             MPRSlices.tsx          # NiiVue MPR with bbox interaction
           sidebar/          # Workflow panel steps
-             UploadPanel.tsx
-             SegmentPanel.tsx
-             CropPanel.tsx
-             MeshPanel.tsx
-             ExportPanel.tsx
+             UploadPanel.tsx      # Phase 1: DICOM drag-drop + series browser
+             ScoutPanel.tsx       # Phase 2: threshold mesh + island list
+             SelectPanel.tsx      # Phase 3: ROI gizmo + bounding box controls
+             AISegmentPanel.tsx   # Phase 4: TotalSegmentator task picker + progress
+             RefinePanel.tsx      # Phase 5: SAM-Med3D click / MedSAM bbox
+             MeshPanel.tsx        # Phase 6: quality sliders + watertight badge
+             ExportPanel.tsx      # Phase 7: format / scale / download
           ui/               # Shadcn/UI components
        store/                # Zustand slices
-          studyStore.ts
-          segmentationStore.ts
-          meshStore.ts
+          studyStore.ts          # DICOM metadata, upload state
+          scoutStore.ts          # island list, selected islands, ROI box
+          segmentationStore.ts   # AI labels, per-label visibility/color
+          meshStore.ts           # final mesh state, quality settings
+          viewportStore.ts       # NiiVue state, R3F camera, crosshair
        hooks/                # TanStack Query hooks
        lib/                  # dcmjs helpers, API client
        types/
@@ -367,16 +558,22 @@ vsp-engine/
     app/
        main.py               # FastAPI app entry
        routers/
-          upload.py
-          segment.py
-          mesh.py
-          jobs.py
+          upload.py         # POST /upload  → NIfTI conversion
+          scout.py          # POST /scout   → HU threshold connected components
+          segment.py        # POST /segment → TotalSegmentator on ROI crop
+          refine.py         # POST /refine/point  /refine/bbox
+          mesh.py           # POST /mesh/generate  GET /mesh/export
+          jobs.py           # GET /jobs/{id}  SSE progress
        services/
-          dicom_service.py  # pydicom + SimpleITK
-          segment_service.py # TotalSegmentator + MONAI
-          mesh_service.py   # MeshLib operations
+          dicom_service.py  # pydicom + SimpleITK + dcm2niix
+          scout_service.py  # MeshLib HU threshold + connected components
+          segment_service.py # TotalSegmentator + task routing
+          refine_service.py  # SAM-Med3D-turbo + MedSAM
+          mesh_service.py   # MeshLib Pass B (final mesh)
        tasks/                # Celery tasks
+          scout_task.py
           segment_task.py
+          refine_task.py
           mesh_task.py
        models/               # Pydantic schemas
        config.py
@@ -397,60 +594,81 @@ vsp-engine/
 
 ---
 
-## 10. Build Plan — Phased Execution
+## 10. Build Plan — Scout → Select → AI → Refine → Export
 
 ### Phase 1: Foundation (Week 1–2)
 
 - [ ] Monorepo setup: `pnpm workspace` + Python `uv` environment
 - [ ] Frontend scaffold: Vite + React + TypeScript + Tailwind + Shadcn/UI init
 - [ ] Backend scaffold: FastAPI + Celery + Redis docker-compose
-- [ ] Basic DICOM upload endpoint: pydicom ingestion NIfTI conversion
+- [ ] Basic DICOM upload endpoint: pydicom → dcm2niix → NIfTI conversion
 - [ ] File storage service (local FS with MinIO abstraction)
-- [ ] DICOM drop zone + series browser in frontend
+- [ ] DICOM drop zone + series browser in frontend; DICOM tag preview
 
 ### Phase 2: Volume Viewer (Week 2–3)
 
-- [ ] Integrate NiiVue into the React viewport (canvas composition with R3F overlay)
+- [ ] Integrate NiiVue into the React viewport (canvas + R3F overlay)
 - [ ] Load backend NIfTI via URL into NiiVue volume renderer
 - [ ] MPR panel: axial / coronal / sagittal slice display
 - [ ] Brightness/contrast/windowing controls (Shadcn sliders)
-- [ ] Zustand store for viewer state
+- [ ] Zustand stores: studyStore + viewportStore
 
-### Phase 3: AI Segmentation (Week 3–5)
+### Phase 3: Scout Pass (Week 3–4)
 
-- [ ] TotalSegmentator Celery task: `total` task for bones
-- [ ] Job progress streaming via SSE frontend progress bar
-- [ ] NiiVue overlay: load segmentation NIfTI as color mask on volume
-- [ ] Structure selector UI: checkboxes for bone classes (ribs, vertebrae, femur, etc.)
-- [ ] HU-threshold fallback mesh for immediate preview (< 5 seconds)
-- [ ] MONAI integration for craniofacial / appendicular subtasks
+- [ ] Backend `/scout` Celery task: MeshLib HU threshold (300 HU) → marching cubes on CPU
+- [ ] `mr.getAllComponents()` → per-island PLY blobs + centroid + AABB + voxel count
+- [ ] Return island list to frontend; SSE progress (fast, 5–10 s)
+- [ ] Frontend: R3F renders each island as a separate colored mesh
+- [ ] Island hover (highlight) + click (toggle select, yellow glow)
+- [ ] ScoutPanel: sorted island checklist sidebar with voxel counts
+- [ ] scoutStore: selected island IDs, computed ROI AABB
 
-### Phase 4: ROI Selection & Mesh Generation (Week 5–7)
+### Phase 4: ROI Selection (Week 4)
 
-- [ ] R3F ROI bounding box: Drei `TransformControls` + box wireframe gizmo
-- [ ] Crop panel: numeric XYZ inputs synced with 3D gizmo
-- [ ] Backend `/mesh/generate`: MeshLib marching cubes on selected label mask
-- [ ] Mesh healing pipeline: fill holes, remove self-intersections, smooth
-- [ ] Mesh simplification: quality slider decimation param
-- [ ] STL/OBJ download from backend
+- [ ] ROI box auto-computed from union of selected island AABBs + 10% padding
+- [ ] R3F `<TransformControls>` gizmo for manual ROI adjustment
+- [ ] SelectPanel: numeric XYZ inputs synced bidirectionally with gizmo
+- [ ] NiiVue: show crop region as highlighted overlay on MPR slices
+- [ ] "Confirm ROI" → lock selection, advance to Phase 5
 
-### Phase 5: Mesh Preview & Refinement (Week 7–8)
+### Phase 5: AI Segmentation on ROI Crop (Week 4–6)
 
-- [ ] Frontend STL loader R3F mesh display with lighting / matcap shader
-- [ ] Mesh quality inspector: face count, volume, watertight check
-- [ ] Wall thickness / shell offset control (for surgical guides / implants)
-- [ ] Scale selection (1:1, 1:2, 1:4) for export
-- [ ] Manual mesh correction tools: smoothing brush, fill hole button
+- [ ] Backend `/segment` Celery task: SimpleITK ROI crop → TotalSegmentator
+- [ ] Task auto-selection logic (island centroid hints → `total`/`craniofacial_structures`/`teeth`)
+- [ ] `roi_subset` hint list reduces TotalSegmentator classes to relevant anatomy
+- [ ] Multilabel NIfTI output → per-label PLY meshes returned to frontend
+- [ ] SSE progress → status bar ("Segmenting: 47%")
+- [ ] Frontend: scout island meshes fade out; AI label meshes fade in
+- [ ] NiiVue: add seg NIfTI as overlay (opacity 0.5, colormap="warm")
+- [ ] AISegmentPanel: named anatomy checklist, show/hide eye, color swatch per label
 
-### Phase 6: Polish & Clinical UX (Week 8–10)
+### Phase 6: Interactive Refinement (Week 6–7)
 
-- [ ] Study management: patient list, past exports
-- [ ] Error handling: corrupt DICOM, insufficient image quality warnings
-- [ ] Accessibility: keyboard navigation, screen reader labels
-- [ ] Performance: WebWorker for in-browser DICOM parsing, lazy R3F chunks
-- [ ] Docs: user guide PDF for surgeons
-- [ ] Docker Compose GPU single-command deploy
+- [ ] SAM-Med3D-turbo backend service: `medim.create_model()` warm-up on startup
+- [ ] Shift-click in R3F → rayCast → world XYZ → voxel (z,y,x) → `/refine/point`
+- [ ] MedSAM backend: NiiVue slice bbox → `/refine/bbox` → stack masks → 3D mask
+- [ ] RefinePanel: tool switcher (point vs box), accept/dismiss per-correction
+- [ ] Corrected mask merges into segmentation store and R3F label mesh
+
+### Phase 7: Mesh Generation & Export (Week 7–8)
+
+- [ ] `/mesh/generate`: MeshLib Pass B on selected labels → per-label repair → boolean union
+- [ ] Mesh quality UI: Preview / Standard / High Detail decimation presets
+- [ ] Shell / hollow offset for surgical guide models
+- [ ] Watertight badge (`topology.isClosed()`) — blocks download if False
+- [ ] STL/OBJ/3MF download with planning watermark metadata
+- [ ] MeshPanel + ExportPanel
+
+### Phase 8: Polish & Clinical UX (Week 8–10)
+
+- [ ] Study management: patient list, past exports, session restore
+- [ ] Robust error handling: corrupt DICOM, low-res scan warnings, OOM recovery
+- [ ] AI weight pre-download on Docker build (`totalseg_download_weights`)
+- [ ] `segmentation_ready` Redis flag → "AI loading…" overlay if weights not ready
+- [ ] Scout works without AI ready — surgeon can proceed to Phase 4 while AI loads
+- [ ] Performance: WebWorker for DICOM parsing, lazy R3F asset loading
 - [ ] Unit + integration tests (Vitest frontend, pytest backend)
+- [ ] Docker Compose GPU single-command deploy
 
 ---
 
