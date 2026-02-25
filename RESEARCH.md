@@ -148,6 +148,335 @@ model = parser.get_parsed_content("network")
 
 ---
 
+### 2.4 VISTA3D — NVIDIA Interactive Foundation Model (Research/Demo Only)
+
+**Repos:** `https://github.com/Project-MONAI/VISTA` | HuggingFace: `nvidia/NV-Segment-CT` / `nvidia/NV-Segment-CTMR`  
+**Stars:** 760 | **License:** ⚠️ **NVIDIA OneWay Noncommercial Research License — COMMERCIAL USE PROHIBITED**  
+**Published:** CVPR 2025  
+
+#### What It Does
+- **VISTA3D-CT:** 127 CT classes — automatic segmentation with NO prompts required
+- **VISTA3D-CTMR:** 345 classes across CT + MR (CT_BODY, MRI_BODY, MRI_BRAIN modes), trained on 30,000+ annotated scans
+- Supports both **automatic** (class label prompt → mask) AND **interactive** (3D point cloud prompts → mask) in same model
+- ShapeKit postprocessing removes false positives, handles small structures
+
+#### API Patterns (MONAI Bundle)
+```python
+# Automatic mode — 127 classes without user input
+python -m monai.bundle run \
+  --config_file configs/inference.json \
+  --input_dict "{'image': 'ct.nii.gz', 'label_prompt': [23, 24, 25]}"
+
+# Interactive mode — points [x,y,z] + labels (1=positive, 0=negative, -1=ignore)
+python -m monai.bundle run \
+  --config_file configs/inference.json \
+  --input_dict "{'image': 'ct.nii.gz', \
+    'points': [[128, 128, 64], [100, 100, 50]], \
+    'point_labels': [1, 0]}"
+```
+
+#### VSP Engine Decision
+> ⚠️ **DO NOT USE IN PRODUCTION.** NVIDIA OneWay Noncommercial Research License prohibits commercial or clinical deployment without a separate NVIDIA commercial agreement. Use TotalSegmentator (Apache 2.0) as the production path. VISTA3D is available only for internal research benchmarking.
+
+---
+
+### 2.5 MedSAM — Segment Anything for Medical Images (Bounding Box)
+
+**Repo:** `https://github.com/bowang-lab/MedSAM`  
+**Stars:** 3.4k | **License:** Apache-2.0  
+**Published:** Nature Communications 2024  
+
+#### What It Does
+- SAM-ViT-B fine-tuned on **1.5 million image-mask pairs** from 10 imaging modalities (CT, MRI, X-ray, ultrasound, endoscopy, dermoscopy, pathology, fundus, OCT, mammography)
+- Input: **2D bounding box** → binary mask for any anatomical structure
+- Works on ANY structure TotalSegmentator does not cover (rare pathologies, surgical hardware, implants)
+- **LiteMedSAM:** 10× faster, designed for laptop/CPU deployment
+
+#### API Pattern
+```python
+# Install: pip install git+https://github.com/bowang-lab/MedSAM.git
+from segment_anything import sam_model_registry
+import torch
+import numpy as np
+
+checkpoint = "medsam_vit_b.pth"
+sam = sam_model_registry["vit_b"](checkpoint=checkpoint)
+sam.eval()
+
+# inference via MedSAM_Inference.py:
+# python MedSAM_Inference.py -i input_img.nii.gz -o output_dir/ --box [x1,y1,x2,y2]
+```
+
+#### VSP Engine Usage
+- Surgeon draws a 2D bounding box on an MPR slice in NiiVue for an unknown structure
+- Frontend sends `[x1, y1, x2, y2]` in NiiVue image coordinates + slice index to backend
+- Backend runs MedSAM on that single slice, returns mask
+- Stack masks across slices → 3D volume for MeshLib extraction
+- Use when TotalSegmentator's 117 classes don't cover what the surgeon needs (e.g., tumor, implant)
+
+---
+
+### 2.6 MedSAM2 — SAM2 for 3D CT + Temporal Video
+
+**Repo:** `https://github.com/bowang-lab/MedSAM2`  
+**Stars:** 800+ | **License:** Apache-2.0  
+**Published:** arXiv April 2025  
+
+#### What It Does
+- Adapts Meta's **SAM2** (video segmentation) to 3D medical imaging
+- Treats CT/MR slices as video frames → propagates segmentation through the volume from one marked slice
+- **RECIST marker workflow:** Surgeon marks the longest diameter on a single axial slice → model propagates to full 3D structure automatically
+- **Efficient MedSAM2:** Lightweight variant for CPU inference (no GPU required)
+- Superior to MedSAM for tubular structures (vessels, bile ducts, spinal canal)
+
+#### Critical Environment Note
+> ⚠️ **MedSAM2 requires `torch==2.5.1`** — this conflicts with TotalSegmentator's `torch<=2.8.0` pin but works within that range ONLY if carefully pinned. Run MedSAM2 in a **separate Docker container or conda environment** to avoid PyTorch version conflicts.
+
+#### API Pattern
+```python
+# Separate environment: pip install torch==2.5.1 medsam2
+from medsam2.build_sam import build_sam2
+from medsam2.sam2_image_predictor import SAM2ImagePredictor
+
+sam2 = build_sam2("sam2_hiera_b+.yaml", "MedSAM2_pretrain.pt")
+predictor = SAM2ImagePredictor(sam2)
+
+# Single-point propagation (RECIST marker → 3D)
+predictor.set_image(ct_slice_np)  # HxW numpy slice
+masks, _, _ = predictor.predict(point_coords=[[cx, cy]], point_labels=[1])
+```
+
+---
+
+### 2.7 SAM-Med3D — Native 3D Promptable Segmentation
+
+**Repo:** `https://github.com/uni-medical/SAM-Med3D`  
+**Stars:** 2.0k | **License:** Apache-2.0  
+**Published:** ECCV 2024 Oral  
+
+#### What It Does
+- Fully **3D SAM architecture** — processes the entire 3D volume rather than per-slice
+- Trained on **SA-Med3D-140K**: 143,000 3D masks across 245 anatomical categories
+- **SAM-Med3D-turbo** checkpoint: significantly improved performance, fine-tuned with more diverse data
+- 10–100× fewer point prompts needed vs 2D SAM applied to 3D volumes
+- One-click 3D point → accurate 3D mask output in a single inference pass
+
+#### API Pattern (via `medim` package)
+```python
+# Install: pip install medim
+import medim
+
+# One-liner model load (downloads SAM-Med3D-turbo checkpoint automatically)
+model = medim.create_model(
+    "SAM-Med3D",
+    pretrained=True,
+    checkpoint_path="sam_med3d_turbo.pth"  # auto-downloaded from HuggingFace
+)
+
+# Inference: surgeon clicks a 3D point in R3F viewport
+# point_coords in (z, y, x) format, normalized to [0,1]
+import torch
+from einops import repeat
+
+point_coords = torch.tensor([[[0.5, 0.3, 0.4]]])  # 1 batch, 1 point, zyx
+point_labels = torch.tensor([[1]])                  # 1 = positive, 0 = negative
+with torch.no_grad():
+    masks = model(image_tensor, point_coords, point_labels)
+# masks: (1, 1, D, H, W) binary volume
+```
+
+#### VSP Engine Usage
+- **Best choice for interactive surgeon-guided refinement** of a structure TotalSegmentator found incorrectly
+- Surgeon clicks inside a bone fragment in the R3F viewport → 3D click coordinates passed to backend → SAM-Med3D-turbo returns precise mask
+- Mask replaces or merges with TotalSegmentator's output for that structure
+- Apache 2.0 — safe for commercial deployment
+
+---
+
+### 2.8 SuPreM — Supervised Pre-training Foundation Model
+
+**Repo:** `https://github.com/MrGiovanni/SuPreM`  
+**Stars:** 700+ | **Published:** ICLR 2024 Oral (top 1.2%)  
+**Institution:** Johns Hopkins University  
+**License:** ⚠️ Check `LICENSE` file — marked "View license", **patents pending**. Not a standard open-source license.  
+
+#### What It Does
+- Supervised pre-training on **AbdomenAtlas 1.1**: 9,262 whole-body CT scans, 25 fully annotated classes (organs + vasculature)
+- Provides **SwinUNETR, U-Net, SegResNet** backbone weights — the best initialization for custom medical segmentation models
+- Transfer learning → user-specific datasets converge 5–10× faster vs random init
+- Task-specific checkpoints available: vertebrae, muscles, cardiac, ribs, liver segments
+- Direct MONAI integration (MONAI Bundle format)
+
+#### Pre-trained Checkpoints Available
+| Task | Backbone | Structures |
+|---|---|---|
+| AbdomenAtlas 1.1 (base) | SwinUNETR | 25 organs + vessels |
+| Vertebrae | SwinUNETR | C1–C7, T1–T12, L1–L5, sacrum |
+| Cardiac | SwinUNETR | 4 chambers + vessels |
+| Muscles | U-Net | 6 major muscle groups |
+| Ribs | SegResNet | 24 ribs individually |
+
+#### VSP Engine Usage
+> **For hospitals with their own labeled bone CT data:** Use SuPreM SwinUNETR weights as initialization, fine-tune with your institution's annotated scans. Converges in ~20 epochs vs 200+ from scratch. Not for use without verifying license for commercial surgical planning.
+
+---
+
+### 2.9 STU-Net — Scalable Universal Pre-trained Model
+
+**Repo:** `https://github.com/uni-medical/STU-Net`  
+**Stars:** 500+ | **License:** Apache-2.0  
+**Published:** MICCAI 2023 (won ATLAS segment, SPPIN challenge; AutoPET II runner-up, BraTS runner-up)  
+
+#### What It Does
+- **Scalable U-Net** built on nnU-Net v2 framework, four size variants:
+  | Variant | Params | GPU RAM | When to Use |
+  |---|---|---|---|
+  | STU-Net-S | 14M | 6 GB | Fast inference, limited GPU |
+  | STU-Net-B | 58M | 10 GB | Balanced accuracy / speed |
+  | STU-Net-L | 440M | 24 GB | High accuracy |
+  | STU-Net-H | 1.4B | 48 GB | Best accuracy, research |
+
+- Pre-trained on **TotalSegmentator annotation atlas** (>100K annotations):
+  - **27 organs** + **59 bones** + **10 muscles** + **8 vessels**
+  - Bones include: all vertebrae, 12 ribs, sternum, femur, tibia, fibula, humerus, radius, ulna, scapula, clavicle, iliac bones, patella, skull, mandible, and more
+- **Best open-source fine-tuning base for orthopedic bone segmentation** — pre-trained on the exact structure set VSP Engine targets
+
+#### Fine-tuning API
+```python
+# nnU-Net v2 based — uses standard nnU-Net training commands
+# Step 1: Convert your DICOM+mask dataset to nnU-Net format
+# nnUNetv2_plan_and_preprocess -d TASKID --verify_dataset_integrity
+
+# Step 2: Fine-tune from STU-Net pre-trained weights
+python run_finetuning.py \
+    3d_fullres \
+    STUNetTrainer_base_ft \   # or small_ft / large_ft / huge_ft
+    TASKID \
+    FOLD \
+    -pretrained_weights path/to/stu_net_base.model
+
+# Inference (same as nnU-Net):
+# nnUNetv2_predict -d TASKID -i INPUT_FOLDER -o OUTPUT_FOLDER -f FOLD
+```
+
+#### VSP Engine Decision
+- **STU-Net-B (Apache 2.0)** is the recommended fine-tuning backbone for building hospital-specific bone segmentation models
+- 59-bone pre-training is the closest match to our surgical planning anatomy targets
+- 10 GB GPU requirement is feasible on a single consumer GPU
+
+---
+
+### 2.10 MedNeXt — ConvNeXt Architecture for Medical Segmentation
+
+**Repo:** `https://github.com/MIC-DKFZ/MedNeXt`  
+**Stars:** 500+ | **License:** Apache-2.0  
+**Published:** MICCAI 2023  
+
+#### What It Does
+- Fully **ConvNeXt-based** 3D segmentation architecture — no transformers, pure CNN
+- **UpKern algorithm:** Initialize large convolution kernels (5×5×5) from smaller-kernel (3×3×3) pre-trained weights → best of both worlds
+- Four variants:
+  | Variant | Params | Kernel | Notes |
+  |---|---|---|---|
+  | MedNeXt-S | 5.6M | 3 | Lightweight |
+  | MedNeXt-B | 10M | 3 | Balanced |
+  | MedNeXt-M | 18M | 5 | UpKern from B |
+  | MedNeXt-L | 63M | 5 | Best accuracy |
+
+- **MedNeXt-L k5 wins KiTS2023 and FLARE22** — outperforms nnU-Net ResEnc L on large-dataset benchmarks
+- Benchmarked by nnU-Net team: MedNeXt-L k5 = best CNN architecture, but STU-Net-H = best overall (when you have 48GB GPU)
+
+#### Import Pattern
+```python
+# Install: pip install nnunet-mednext
+from nnunet_mednext import create_mednext_v1
+
+model = create_mednext_v1(
+    num_input_channels=1,
+    num_classes=14,       # your class count
+    model_id="L",         # S, B, M, L
+    kernel_size=5,        # 3 or 5
+    deep_supervision=True
+)
+```
+
+#### VSP Engine Decision
+- Use MedNeXt-L k5 if you need a strong architecture for custom training with <200 cases (beating nnU-Net in low-data regime is well documented)
+
+---
+
+### 2.11 Auto3DSeg — Automated 3D Segmentation (MONAI AutoRunner)
+
+**Repo:** `https://github.com/Project-MONAI/MONAI` (auto3dseg module)  
+**License:** Apache-2.0  
+**Published:** Won MICCAI 2022 HECKTOR 1st place, INSTANCE22 2nd place (1st in Dice)  
+
+#### What It Does
+- **AutoML for 3D medical segmentation** — AutoRunner wraps DiNTS + SegResNet + SwinUNETR ensemble
+- Minimal input: datalist JSON + task YAML (modality + class names + paths)
+- Handles: data preprocessing, hyperparameter search, ensemble training, ensemble prediction
+- Produces a final ensemble model that often beats any single architecture
+
+#### API Pattern
+```python
+# task.yaml:
+# modality: CT
+# datalist: ./datalist.json
+# dataroot: /data/
+# multigpu: True
+# class_names: [femur_left, femur_right, tibia_left, tibia_right]
+
+python -m monai.apps.auto3dseg AutoRunner run --input='./task.yaml'
+
+# Or programmatically:
+from monai.apps.auto3dseg import AutoRunner
+runner = AutoRunner(input="./task.yaml")
+runner.run()
+```
+
+#### VSP Engine Decision
+- Use Auto3DSeg when a hospital provides a new annotated bone dataset (>100 cases) and wants the best possible custom model with minimal ML expertise required
+
+---
+
+### 2.12 Segmentation Strategy — Tiered Selection for VSP Engine
+
+Based on the landscape above, VSP Engine implements a **5-tier segmentation strategy**:
+
+```
+Tier 1 — Fast HU Fallback (no GPU, <5s):
+  DICOM → MeshLib VDB → marching cubes at Otsu HU threshold → mesh
+  Use when: No GPU available, quick preview, rough anatomy overview
+
+Tier 2 — AI Automatic (GPU, 60–300s):
+  DICOM → NIfTI (dcm2niix) → TotalSegmentator (total/craniofacial/teeth/mr_body/etc.)
+  → per-bone NIfTI masks → user selects bones → MeshLib → STL
+  Use when: Standard CT/MR case, surgeon wants pre-labeled bone structure list
+  Note: 'craniofacial_structures' + 'teeth' tasks added in TotalSegmentator v2 (2025, CVPR)
+
+Tier 3 — Interactive 3D Point Refinement (GPU, ~2s per click):
+  SAM-Med3D-turbo → surgeon clicks 3D point in R3F viewport → binary 3D mask
+  Use when: TotalSegmentator misses/mislabels a structure, surgeon wants custom structure
+  Note: Apache 2.0, safe for commercial use
+
+Tier 4 — Interactive 2D Box Prompt (CPU or GPU, ~1s per slice):
+  MedSAM → surgeon draws 2D bounding box on MPR slice → binary mask + 3D stacking
+  Use when: Rare structure, 2D box more natural than 3D point, CPU-only deployment
+
+Tier 5 — Hospital Custom Fine-Tuned Model:
+  STU-Net-B/L fine-tuned on hospital's labeled data (SuPreM init for abdomen)
+  OR MedNeXt-L k5 (best for small datasets <200 cases)
+  OR Auto3DSeg (best ensemble for new anatomy domains)
+  Use when: Hospital has >50 annotated scans, needs institution-specific accuracy
+```
+
+**Licensing summary for production deployability:**
+- ✅ Tier 1–4: All Apache 2.0 (TotalSegmentator, MeshLib non-commercial, MedSAM, SAM-Med3D)
+- ⚠️ MeshLib: Commercial license required for production deployment
+- ❌ VISTA3D: NVIDIA NonComm — excluded from all production tiers
+
+---
+
 ## 3. Mesh Processing Layer
 
 ### 3.1 MeshLib (Primary)
@@ -447,17 +776,37 @@ Selected bones → binary mask NIfTI → MeshLib marching cubes → heal → sim
 
 **Alternative path (MeshLib direct):** Could use MeshLib's DICOM loader for the mesh branch to skip the NIfTI conversion step, loading directly from DICOM to VDB → marching cubes. This is faster but we lose the TotalSegmentator-guided bone separation. Use it for the HU-threshold fallback mode.
 
-### 7.2 Two-Mode Segmentation Strategy
+### 7.2 Five-Tier Segmentation Strategy
+
+VSP Engine exposes five segmentation tiers. The frontend shows Tier 1–2 by default; Tiers 3–5 are advanced options.
 
 ```
-Mode 1 (Default): AI-Guided
-  DICOM → NIfTI → TotalSegmentator --fast → per-bone NIfTI masks → 
-  user selects bones → MeshLib boolean on selected masks → STL
+Tier 1 — HU Threshold Fallback (no GPU, <5 s):
+  DICOM → MeshLib VDB → marching cubes at Otsu HU → mesh → STL
+  Code: mr.VoxelsLoad.loadDicomsFolderTreeAsVdb() + mr.marchingCubesFloat()
 
-Mode 2 (HU Threshold Fallback — fast preview):
-  DICOM → MeshLib VDB → marching cubes at HU ~300 → mesh → STL
-  (same as ct2print, no AI needed, runs in <5s)
+Tier 2 — TotalSegmentator AI (GPU, 60–300 s):
+  DICOM → dcm2niix NIfTI → totalsegmentator(input, task="total", roi_subset=[...])
+  → per-bone NIfTI masks → user selects → MeshLib boolean → STL
+  Available subtasks (2025): total, total_mr, craniofacial_structures, teeth,
+  trunk_cavities, vertebrae_body, appendicular_bones (license), mr_body
+
+Tier 3 — SAM-Med3D 3D Point Prompts (GPU, ~2 s/click):
+  Surgeon clicks 3D point in R3F viewport → (z,y,x) coords → backend
+  → medim.create_model('SAM-Med3D', pretrained=True) → binary 3D mask
+  → merge with TotalSegmentator output → MeshLib → STL
+
+Tier 4 — MedSAM 2D Box Prompts (CPU or GPU, ~1 s/slice):
+  Surgeon draws 2D bbox on MPR slice in NiiVue → [x1,y1,x2,y2] + slice_idx
+  → MedSAM inference → stack masks across z-axis → 3D volume → MeshLib
+
+Tier 5 — Custom Fine-Tuned Model (hospital data, offline training):
+  STU-Net-B (59-bone pre-train, Apache 2.0) or MedNeXt-L k5 (best small-dataset CNN)
+  Fine-tune with hospital annotations → drop-in nnU-Net v2 predictor
+  OR: Auto3DSeg AutoRunner (DiNTS+SegResNet+SwinUNETR ensemble) for new domains
 ```
+
+Note: VISTA3D (127 classes, CVPR 2025) excluded from all production tiers — NVIDIA OneWay Noncommercial License.
 
 ### 7.3 Otsu Threshold for Bone Isolation
 
@@ -571,6 +920,13 @@ SlicerTotalSegmentator and TotalSegmentator both auto-download weights on first 
 - ⚠️ **Patient orientation** — spine must be at bottom in axial view (standardize with `dcm2niix`)
 - ⚠️ **appendicular_bones** task requires license — use default `total` or apply for free academic license
 
+### From New AI Tools (2025)
+- ⚠️ **VISTA3D (NVIDIA OneWay NonComm)** — DO NOT use in production; NVIDIA noncommercial license prohibits commercial or clinical deployment
+- ⚠️ **MedSAM2 torch pin** — requires `torch==2.5.1`; run in separate conda env or Docker container from TotalSegmentator
+- ⚠️ **SuPreM license unclear** — marked "patents pending"; verify before any commercial use
+- ⚠️ **SAM-Med3D input format** — expects 128³ patch, (z,y,x) coordinate order; resample/crop around clicked point before inference
+- ⚠️ **STU-Net-H (1.4B params)** — requires 48 GB VRAM; STU-Net-B (58M, 10 GB) is the practical default
+
 ### From MeshLib
 - ⚠️ **License** — non-commercial free; need paid license for commercial deployment. Check if non-commercial academic + planning-only classification applies
 - ⚠️ **Marching cubes threshold** — HU 300 is typical for compact bone; trabecular bone at ~100-200 HU; adjust per scan
@@ -599,6 +955,15 @@ SlicerTotalSegmentator and TotalSegmentator both auto-download weights on first 
 |---|---|---|
 | TotalSegmentator (total, total_mr, body tasks) | Apache-2.0 | ✅ Free |
 | TotalSegmentator (appendicular_bones, heartchambers_highres, tissue_types) | Custom (Academic: free, Commercial: contact) | ⚠️ Need license |
+| TotalSegmentator (brain_aneurysm task) | CC BY-NC 4.0 | ❌ No commercial |
+| VISTA3D-CT / VISTA3D-CTMR | NVIDIA OneWay Noncommercial | ❌ No commercial |
+| MedSAM | Apache-2.0 | ✅ Free |
+| MedSAM2 | Apache-2.0 | ✅ Free |
+| SAM-Med3D / SAM-Med3D-turbo | Apache-2.0 | ✅ Free |
+| STU-Net (all variants) | Apache-2.0 | ✅ Free |
+| MedNeXt | Apache-2.0 | ✅ Free |
+| Auto3DSeg (MONAI module) | Apache-2.0 | ✅ Free |
+| SuPreM | Patents pending — check LICENSE | ⚠️ Verify before use |
 | nnU-Net | Apache-2.0 | ✅ Free |
 | MONAI | Apache-2.0 | ✅ Free |
 | MeshLib | Non-commercial free / Commercial paid | ⚠️ Need commercial license |

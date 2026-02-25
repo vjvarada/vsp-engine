@@ -8,7 +8,7 @@ applyTo: "**"
 
 VSP Engine is a virtual surgery planning web platform. It ingests DICOM CT/MR scans, runs AI bone segmentation (TotalSegmentator + MONAI), lets surgeons select a region of interest, and exports a watertight 3D-printable STL mesh. It is NOT a certified medical device — always label outputs as "FOR PLANNING PURPOSES ONLY."
 
-> **Reference docs**: See [RESEARCH.md](../../RESEARCH.md) for validated API patterns, version pins, licensing notes, and workflow decisions derived from 11 open-source reference projects (TotalSegmentator, MeshLib, NiiVue, ct2print, brain2print, OHIF, etc.). See [ARCHITECTURE.md](../../ARCHITECTURE.md) for the full system design.
+> **Reference docs**: See [RESEARCH.md](../../RESEARCH.md) for validated API patterns, version pins, licensing notes, and workflow decisions derived from 19 open-source reference projects (TotalSegmentator, MeshLib, NiiVue, ct2print, brain2print, OHIF, VISTA3D, MedSAM, SAM-Med3D, SuPreM, STU-Net, MedNeXt, Auto3DSeg, etc.). See [ARCHITECTURE.md](../../ARCHITECTURE.md) for the full system design.
 
 ## Architecture
 
@@ -35,7 +35,13 @@ VSP Engine is a virtual surgery planning web platform. It ingests DICOM CT/MR sc
 - Always use Pydantic v2 models for request/response schemas
 - MeshLib: `import meshlib.mrmeshpy as mr` — always use the `mr.` prefix
 - TotalSegmentator: call via Python API `totalsegmentator(input_img, task="total")`; never shell out; always pin `torch<=2.8.0` and `SimpleITK==2.0.2` (nnU-Net 3D conv regression in torch ≥ 2.9.0)
-- Two-mode segmentation: Mode 1 = AI (TotalSegmentator); Mode 2 = HU-threshold fallback via `mr.VoxelsLoad.loadDicomsFolderTreeAsVdb()` + marching cubes at Otsu HU, completes in <5 s
+- TotalSegmentator 2025 new subtasks: `craniofacial_structures` (mandible, maxillary/frontal sinuses, teeth_upper/teeth_lower, skull, head), `teeth` (individual FDI notation with pulp+canal — CVPR 2025 ToothFairy3), `trunk_cavities`. Use for maxillofacial and dental planning.
+- Five-tier segmentation strategy: Tier 1 = MeshLib HU-threshold <5 s; Tier 2 = TotalSegmentator auto AI; Tier 3 = SAM-Med3D-turbo 3D point prompts; Tier 4 = MedSAM 2D bbox prompts; Tier 5 = STU-Net-B fine-tuned on hospital data
+- SAM-Med3D-turbo (Apache 2.0): `import medim; model = medim.create_model("SAM-Med3D", pretrained=True)` — surgeon 3D click in R3F viewport → binary 3D mask; input point in (z,y,x) format
+- MedSAM (Apache 2.0): surgeon draws 2D bbox on NiiVue MPR slice → `[x1,y1,x2,y2]` + slice_idx → MedSAM inference → stack masks across z → 3D binary volume
+- MedSAM2 (Apache 2.0): requires `torch==2.5.1` — **always run in a separate Docker service or conda env**, never in the same process as TotalSegmentator
+- STU-Net-B (Apache 2.0, 58M params): best fine-tuning backbone for custom bone segmentation (pre-trained on 59 bones via TotalSegmentator atlas); fine-tune via nnU-Net v2 `run_finetuning.py -pretrained_weights`
+- VISTA3D (NVIDIA OneWay Noncommercial): **DO NOT use in any production or clinical path** — see DO NOT section
 - Always crop ROI before calling TotalSegmentator to avoid GPU OOM on large volumes
 - After mesh generation always call `topology.isClosed()` before offering STL download
 - Celery tasks: always update task state with `self.update_state(state="PROGRESS", meta={"percent": n})`
@@ -70,12 +76,19 @@ backend/app/tasks/                 — Celery async tasks
 | FastAPI           | `from fastapi import FastAPI, UploadFile, BackgroundTasks`                  |
 | TotalSegmentator  | `from totalsegmentator.python_api import totalsegmentator`                  |
 | MONAI             | `from monai.bundle import ConfigParser`                                     |
+| SAM-Med3D-turbo   | `import medim; model = medim.create_model("SAM-Med3D", pretrained=True)`    |
+| MedSAM            | `from segment_anything import sam_model_registry` (medsam_vit_b.pth ckpt)  |
+| STU-Net           | nnU-Net v2 trainer: `STUNetTrainer_base_ft` (fine-tune) or `STUNetTrainer_base` (scratch) |
 
 ## DO NOT
 
 - Do not use Redux — use Zustand
 - Do not use class components
-- Do not shell out to subprocesses for TotalSegmentator/MONAI — use Python APIs
+- Do not shell out to subprocesses for TotalSegmentator/MONAI/SAM-Med3D/MedSAM — use Python APIs
 - Do not store patient data beyond temporary session storage
 - Do not skip mesh healing before STL export
 - Do not use `console.log` in production code — use a logger utility
+- **Do not use VISTA3D in any production, commercial, or clinical path** — NVIDIA OneWay Noncommercial License prohibits it
+- **Do not run MedSAM2 in the same Python process or container as TotalSegmentator** — incompatible torch versions (`torch==2.5.1` vs `torch<=2.8.0`)
+- Do not use SuPreM weights in production without verifying the license file ("patents pending" — not a standard OSS license)
+- Do not offer STL download until `topology.isClosed()` returns `True`
