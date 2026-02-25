@@ -1117,3 +1117,332 @@ def voxel_to_sam_med3d_point(voxel_ijk: tuple[int,int,int],
     si, sj, sk = crop_size
     return ((k-ok)/sk, (j-oj)/sj, (i-oi)/si)  # z_norm, y_norm, x_norm
 ```
+
+---
+
+## 16. Code Quality Standards
+
+> These rules apply to every file generated or modified in VSP Engine. Enforced by CI (ESLint + Ruff + mypy). No exceptions.
+
+---
+
+### 16.1 TypeScript / React
+
+#### Naming Conventions
+
+| Kind | Convention | Example |
+|---|---|---|
+| React component | PascalCase | `ScoutPanel`, `CropBox`, `MPRCropOverlay` |
+| Custom hook | `use` + camelCase | `useScoutIslands`, `useROI`, `useNiiVue` |
+| Zustand store file | camelCase | `scoutStore.ts`, `meshStore.ts` |
+| Zustand interface | PascalCase | `ScoutState`, `MeshState` |
+| Event handler | `handle` prefix | `handleIslandClick`, `handleROIConfirm` |
+| Boolean variable | `is`/`has`/`can` prefix | `isLocked`, `hasError`, `canExport` |
+| Module-level constant | SCREAMING_SNAKE_CASE | `MIN_ROI_SIZE_MM`, `BONE_HU_THRESHOLD` |
+| Type / interface | PascalCase | `TaskStatus`, `IslandMeta`, `WorldMm` |
+| Utility file | kebab-case | `coord-transforms.ts`, `hu-threshold.ts` |
+| Test file | co-located, `.test.tsx` | `CropBox.test.tsx` next to `CropBox.tsx` |
+
+#### TypeScript Strict Settings (`tsconfig.json`)
+
+```json
+{
+  "compilerOptions": {
+    "strict": true,
+    "exactOptionalPropertyTypes": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true
+  }
+}
+```
+
+- Never use `any` — use `unknown` with a type-guard predicate or `never` for exhaustive switch
+- Never use `as unknown as T` — write an explicit type guard function instead
+- Use `satisfies` to validate config-object shape without widening the type:
+  ```ts
+  const AXIS_COLORS = {
+    x: '#ff4444',
+    y: '#44ff44',
+    z: '#4488ff',
+  } satisfies Record<'x' | 'y' | 'z', string>
+  ```
+- Prefer `interface` for public API contracts; `type` for unions, intersections, and mapped types
+- Use `import type { ... }` for type-only imports to keep runtime bundles clean
+- Model task outcomes as a discriminated union — every branch is type-safe:
+  ```ts
+  type TaskResult<T> =
+    | { status: 'idle' }
+    | { status: 'running'; percent: number }
+    | { status: 'done'; data: T }
+    | { status: 'error'; message: string }
+  ```
+- Zustand slice: one `interface` for state + one `interface` for actions, intersected:
+  ```ts
+  interface ScoutState {
+    islands: IslandMeta[]
+    roi: ROIState
+    taskStatus: TaskStatus
+    errorMessage: string | null
+  }
+  interface ScoutActions {
+    setIslands(islands: IslandMeta[]): void
+    setROI(roi: ROIState): void
+    reset(): void
+  }
+  const useScoutStore = create<ScoutState & ScoutActions>()(...)
+  ```
+
+#### ESLint Key Rules (enforced via CI)
+
+```js
+// eslint.config.js
+"complexity":                                ["error", 5],
+"max-lines-per-function":                    ["warn",  40],
+"@typescript-eslint/no-explicit-any":         "error",
+"@typescript-eslint/consistent-type-imports": "error",
+"@typescript-eslint/no-unused-vars":          "error",
+"react-hooks/rules-of-hooks":                "error",
+"react-hooks/exhaustive-deps":               "warn",
+"no-console":                                "error",
+"jsx-a11y/aria-props":                       "error",
+```
+
+#### Cyclomatic Complexity — Max 5 branches per function
+
+**Guard clauses instead of nesting:**
+```tsx
+// ❌ nested if blocks
+function handleClick(e, island) {
+  if (island) {
+    if (!store.isLocked) {
+      if (e.shiftKey) { addToSelection(island.id) } else { setSelection([island.id]) }
+    }
+  }
+}
+
+// ✅ flat guard + early return
+function handleIslandClick(e: ThreeEvent<MouseEvent>, island: IslandMeta): void {
+  if (!island || store.isLocked) return
+  if (e.shiftKey) { addToSelection(island.id); return }
+  setSelection([island.id])
+}
+```
+
+**Lookup table instead of `if/else` chain:**
+```ts
+// ❌ branching task router
+if (region === 'skull')          task = 'craniofacial_structures'
+else if (region === 'teeth')     task = 'teeth'
+else                             task = 'total'
+
+// ✅ declarative lookup
+const TASK_BY_REGION: Readonly<Record<HintRegion, TotalsegTask>> = {
+  skull:     'craniofacial_structures',
+  teeth:     'teeth',
+  vertebrae: 'total',
+} as const
+const task: TotalsegTask = TASK_BY_REGION[region] ?? 'total'
+```
+
+**No nested ternaries** — extract to a named variable or function.
+
+#### Cognitive Complexity — Component max 120 lines, function max 40 lines
+
+**Extract sub-components** for list items and repeated patterns:
+- `<IslandListItem>` — not inline in `<ScoutPanel>`
+- `<AxisSlider axis="x" ... />` — not inline in `<SelectPanel>`
+- `<LabelRow label={label} ... />` — not inline in `<AISegmentPanel>`
+
+**Extract custom hooks** for any `useEffect` + state pair that exceeds 10 lines:
+```ts
+// ❌ 30 lines of logic buried in a component
+const [islands, setIslands] = useState([])
+useEffect(() => { /* ...25 lines... */ }, [studyId])
+
+// ✅ extracted to useScoutIslands.ts
+export function useScoutIslands(studyId: string) { ... }
+```
+
+**No logic in the JSX `return`** — compute above the `return` statement:
+```tsx
+// ❌ filter + sort inline in JSX
+return <ul>{islands.filter(i => i.voxelCount > 50).sort(bySize).map(renderRow)}</ul>
+
+// ✅
+const visibleIslands = useMemo(() => islands.filter(hasEnoughVoxels).sort(bySize), [islands])
+return <ul>{visibleIslands.map(island => <IslandListItem key={island.id} island={island} />)}</ul>
+```
+
+**No side effects in render path** — all data fetching and subscriptions live inside `useEffect` or TanStack Query.
+
+#### React Patterns
+
+- All components are pure functions. No class components.
+- `React.memo`: wrap only components that (a) receive stable-reference props AND (b) render frequently — e.g., individual R3F island meshes, `<LabelRow>` in a long list. Do not apply everywhere.
+- `useCallback`: only when the function is passed as a prop to a `React.memo` child, or appears in a `useEffect` dependency array.
+- `useMemo`: only for genuinely expensive computations (>1 ms measured). Not for simple object literals.
+- `useRef`: for NiiVue instance, Three.js geometry/material refs, animation frame IDs — values that mutate without triggering re-renders.
+- **R3F resource disposal** in `useEffect` cleanup:
+  ```ts
+  useEffect(() => () => { geometry.dispose(); material.dispose() }, [])
+  ```
+- **NiiVue disposal**: always `nv.dispose()` in `useEffect` cleanup.
+- **No inline arrow functions on `React.memo` children** — they create new references every render:
+  ```tsx
+  // ❌  <IslandMesh onSelect={() => selectIsland(id)} />
+  // ✅  const handleSelect = useCallback(() => selectIsland(id), [id])
+  //     <IslandMesh onSelect={handleSelect} />
+  ```
+- One component per file. No multi-component files.
+- No prop drilling beyond 2 levels — use a Zustand selector or React context.
+
+#### Accessibility (ARIA)
+
+| Element | Required attributes |
+|---|---|
+| Icon-only button | `aria-label="[action description]"` |
+| Range slider | `aria-label`, `aria-valuemin`, `aria-valuemax`, `aria-valuenow` |
+| Progress bar | `role="progressbar"`, `aria-valuenow`, `aria-valuemin={0}`, `aria-valuemax={100}` |
+| R3F `<Canvas>` | `aria-label="3D [description] viewport"`, `role="img"` |
+| Modal / dialog | `role="dialog"`, `aria-modal="true"`, `aria-labelledby` →  title |
+| Color-coded info | Always supplement with a text label — never rely on color alone |
+
+#### Dead Code & Hygiene
+
+- **No `console.log/warn/error`** — use `src/lib/logger.ts` (`logger.debug/info/warn/error`)
+- **No commented-out code blocks** — use git history
+- **No unused imports** — ESLint `@typescript-eslint/no-unused-vars` runs in CI
+- **`import type { ... }`** for every type-only import (enforced by `consistent-type-imports`)
+- **One exported component per file** — internal helpers stay as unexported functions in the same file if < 20 lines, otherwise split to their own file
+
+---
+
+### 16.2 Python / Backend
+
+#### Naming Conventions
+
+| Kind | Convention | Example |
+|---|---|---|
+| Function / variable | snake_case | `run_scout_pass`, `vox_data` |
+| Class (Pydantic/dataclass) | PascalCase | `ScoutResult`, `SegmentRequest` |
+| Module-level constant | SCREAMING_SNAKE_CASE | `BONE_HU_THRESHOLD = 300` |
+| Private helper | `_` prefix | `_apply_morphological_close` |
+| Celery task name (string) | `module.action` | `"scout.run_scout_pass"` |
+| Module file | snake_case | `scout_service.py`, `coord_service.py` |
+
+#### Type Strictness
+
+- `from __future__ import annotations` at the top of every module
+- Complete PEP 526 type hints on all public functions — mypy `strict = true` in CI
+- `TypeAlias` for complex nested types: `IslandList: TypeAlias = list[IslandMeta]`
+- `Protocol` for storage and model interfaces to enable DI and unit testing without real MinIO/GPU
+- Pydantic v2 response models: `model_config = ConfigDict(frozen=True)`
+
+#### Tooling Config (`pyproject.toml`)
+
+```toml
+[tool.ruff]
+select = ["E", "F", "I", "N", "UP", "ANN", "B", "C90", "RUF"]
+ignore = ["ANN101", "ANN102"]  # self/cls annotations not required
+max-line-length = 100
+
+[tool.ruff.mccabe]
+max-complexity = 8
+
+[tool.mypy]
+strict = true
+ignore_missing_imports = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+```
+
+#### Module Boundary Rules
+
+```
+┌──────────────┐     ┌──────────────┐
+│   Routers    │────▶│   Services   │
+└──────────────┘     └──────┬───────┘
+                            │
+┌──────────────┐            │
+│ Celery Tasks │────────────┘
+└──────────────┘
+
+✅  Routers call services — parse request → call service → return response
+✅  Celery tasks call services — serialize args → call service → update state
+❌  Services must NOT import from routers or tasks
+❌  Services must NOT accept FastAPI Request / Response objects
+❌  Routers must NOT contain business logic (no MeshLib, no SimpleITK)
+❌  Celery tasks must NOT contain business logic (only service calls + state updates)
+```
+
+This one-way dependency allows services to be unit-tested without starting a FastAPI app or Celery worker.
+
+#### Cyclomatic Complexity — Max 8 per function
+
+**Dispatch table instead of `elif` chain:**
+```python
+# ❌ branching
+def pick_task(hint: str) -> str:
+    if hint == "skull":   return "craniofacial_structures"
+    elif hint == "teeth": return "teeth"
+    else:                 return "total"
+
+# ✅ declarative table
+_HINT_TO_TASK: dict[str, str] = {
+    "skull": "craniofacial_structures",
+    "teeth": "teeth",
+}
+def pick_task(hint: str) -> str:
+    return _HINT_TO_TASK.get(hint, "total")
+```
+
+**Guard clause instead of nesting:**
+```python
+# ❌ business logic buried in nested ifs
+def extract_roi(image, roi):
+    if image is not None:
+        if roi.is_valid():
+            ...  # work happens here at indent level 3
+
+# ✅ flat — work starts at indent level 1
+def extract_roi(image: sitk.Image, roi: ROIBox) -> sitk.Image:
+    if image is None:
+        raise ValueError("image must not be None")
+    if not roi.is_valid():
+        raise ValueError(f"Invalid ROI: {roi}")
+    ...
+```
+
+#### Error Handling
+
+- Typed domain exceptions in `app/exceptions.py`: `ScoutFailed`, `SegmentOOM`, `MeshNotWatertight`, `StudyNotFound`
+- FastAPI: one `@app.exception_handler` per domain exception type — no ad-hoc `raise HTTPException` inside services
+- Celery tasks: always wrap the service call; report failure and re-raise:
+  ```python
+  @app.task(bind=True, name="scout.run_scout_pass")
+  def run_scout_pass(self: Task, study_id: str) -> None:
+      try:
+          result = scout_service.run(study_id)
+          self.update_state(state="SUCCESS", meta={"islands": len(result.islands)})
+      except Exception as exc:
+          self.update_state(state="FAILURE", meta={"error": str(exc), "type": type(exc).__name__})
+          raise
+  ```
+- **Never swallow exceptions** — `except Exception: pass` is forbidden (Ruff rule `B001`)
+
+#### Logging
+
+- `logger = logging.getLogger(__name__)` at module level — never `print()`
+- Log levels:
+
+| Level | When to use |
+|---|---|
+| `DEBUG` | Voxel counts, mesh triangle counts, per-island stats |
+| `INFO` | Task start, task complete, study upload |
+| `WARNING` | Scan QC issues (thick slices, missing coverage) |
+| `ERROR` | Task failure, OOM, watertight check failed |
+
+- Never log PHI values — log `study_id` UUID only, never patient name, DOB, or scan metadata that could identify a patient
