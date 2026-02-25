@@ -25,6 +25,9 @@ VSP Engine is a virtual surgery planning web platform. It ingests DICOM CT/MR sc
 - Use Zustand slices for global state — avoid prop drilling > 2 levels
 - React Three Fiber: use declarative JSX geometry (`<mesh>`, `<boxGeometry>`) not imperative Three.js
 - Import R3F types from `@react-three/fiber`, helpers from `@react-three/drei`
+- **ROI Crop Box: do NOT use `Drei TransformControls` for the crop gizmo** — it moves the whole box. Implement a custom `<CropBox>` with 6 separate face-center drag handles, each constrained to one axis (X⁻ X⁺ Y⁻ Y⁺ Z⁻ Z⁺). Color X=red, Y=green, Z=blue (DICOM/ITK convention). Clamp each axis: `min < max - MIN_SIZE`.
+- **ROI Panel: 3 dual-range sliders** (one per axis, two thumbs) + 6 numeric mm inputs, all synced to `scoutStore.roi` — not just a single XYZ triplet
+- **MPR crop lines: Canvas 2D overlay** drawn on top of NiiVue canvas (position: absolute). Axial MPR shows Z⁻/Z⁺ blue lines; Coronal shows Y⁻/Y⁺ green; Sagittal shows X⁻/X⁺ red. Use `nv.mm2frac()` to convert world mm to canvas pixel positions.
 - NiiVue: always wrap in a `useEffect` with cleanup to call `nv.dispose()` on unmount
 - File naming: PascalCase for components, camelCase for hooks (useMyHook.ts), kebab-case for utils
 

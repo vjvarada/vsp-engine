@@ -198,7 +198,7 @@ The workflow is designed so the surgeon sees *something* in under 10 seconds and
 | ---- | --------------- | --------- | --------------------------------------------------------------------------------------------------------------- |
 | 📥   | **Upload**      | 2–5 s     | DICOM drag-drop → dcm2niix NIfTI conversion in background; NiiVue starts rendering raw CT immediately            |
 | 🔍   | **Scout**       | 5–10 s    | MeshLib HU threshold (~300 HU) → connected-component islands → per-island colored 3D mesh overlaid in R3F; surgeon can visually inspect all bone anatomy at once  |
-| 🎯   | **Select**      | 0 s       | Surgeon **clicks bone islands** in the 3D view to select anatomy of interest; OR draws a manual 3D bounding box; system auto-computes tight ROI AABB with 10% padding |
+| 🎯   | **Select**      | 0 s       | Surgeon **clicks bone islands** in the 3D view to select anatomy of interest; OR draws a manual 3D bounding box. System auto-computes tight ROI AABB. **6-handle crop box** (one draggable arrow per face: X⁻ X⁺ Y⁻ Y⁺ Z⁻ Z⁺) lets the surgeon fine-tune each axis independently. SelectPanel shows three dual-range sliders (one per axis) **and** the NiiVue MPR views each show a colored crop-plane line that moves in sync — axial slice shows Z⁻/Z⁺ lines, coronal shows Y⁻/Y⁺, sagittal shows X⁻/X⁺. |
 | 🤖   | **AI Segment**  | 5–120 s   | TotalSegmentator runs on **cropped ROI volume only** → per-bone NIfTI labels; colored labels replace rough threshold islands; sidebar shows named anatomy checklist |
 | ✏️   | **Refine**      | 2 s/click | Optional: surgeon clicks a misclassified region → SAM-Med3D-turbo 3D point → corrected mask; OR draws 2D bbox on MPR → MedSAM slice refinement |
 | ⚙️   | **Mesh**        | 5–15 s    | MeshLib on selected AI masks → repair → simplify; quality/thickness/hollow sliders; watertight badge            |
@@ -274,9 +274,37 @@ CLIENT:  R3F loads each island PLY as a separate <mesh>
 CLIENT:  Surgeon selects ≥1 islands (click in R3F or sidebar checkbox)
          System: union of selected island AABBs → tight crop bbox
                  + 10% padding each axis → proposed ROI box
-         ROI box shown as Drei <TransformControls> gizmo (adjustable)
-         Numeric XYZ fields in context panel for precise entry
-         "Confirm ROI" button → lock crop, show crop preview in NiiVue
+
+         ROI box rendered as a custom <CropBox> R3F component:
+           - Wireframe box outline in cyan
+           - 6 face-center drag handles (one per face, arrow mesh):
+               X⁻ (left)   X⁺ (right)
+               Y⁻ (front)  Y⁺ (back)
+               Z⁻ (bottom) Z⁺ (top)
+           - Each handle constrained to its axis only (no off-axis drift)
+           - Handles clamp: Xmin < Xmax, Ymin < Ymax, Zmin < Zmax
+           - NOT Drei TransformControls (that moves the whole box; wrong here)
+
+         SelectPanel (context panel) shows:
+           Axis    | Face-      | Face+     | mm values
+           ─────────────────────────────────────────────
+           X (R→L) | ←  ──●──  |  ──●──  → | e.g. 45 mm … 312 mm
+           Y (A→P) | ←  ──●──  |  ──●──  → | e.g. 80 mm … 290 mm
+           Z (I→S) | ←  ──●──  |  ──●──  → | e.g. 120 mm … 480 mm
+
+           Three dual-handle range sliders (Shadcn Slider, min/max thumbs)
+           + numeric text inputs for each of the 6 values
+           All inputs two-way synced with the 3D handles
+
+         NiiVue MPR views show crop-plane lines in sync:
+           Axial slice   (XY plane, scroll = Z) → horizontal dashed lines at Zmin, Zmax
+           Coronal slice (XZ plane, scroll = Y) → horizontal dashed lines at Ymin, Ymax
+           Sagittal slice(YZ plane, scroll = X) → horizontal dashed lines at Xmin, Xmax
+           Lines drawn via a Canvas 2D overlay absolutely positioned over NiiVue canvas
+           (NiiVue does not have a native annotation API for crop lines)
+
+         "Confirm ROI" button → lock crop, pass 6 values to backend
+         Locked state: handles dim, box turns orange, "Edit ROI" to reopen
 
 
 ── PHASE 4: AI SEGMENT ────────────────────────────────── 5–120 s ──
@@ -515,7 +543,123 @@ mr.saveMesh(result, "output.stl")
 
 ---
 
-## 9. File Structure
+## 9. ROI Crop Box — 6-Handle Component Design
+
+The crop box needs **independent per-axis face handles**, not a whole-box transform. `Drei TransformControls` is the wrong tool here — it applies unified translate/rotate/scale to the object as a whole. We need 6 separate draggable arrows.
+
+### R3F Component Architecture
+
+```tsx
+// components/viewport/CropBox.tsx
+import { useRef, useState } from 'react'
+import { ThreeEvent } from '@react-three/fiber'
+import { Line } from '@react-three/drei'
+
+interface CropBoxProps {
+  min: [number, number, number]   // [Xmin, Ymin, Zmin] in world mm
+  max: [number, number, number]   // [Xmax, Ymax, Zmax] in world mm
+  onChange: (min: [number, number, number], max: [number, number, number]) => void
+  locked?: boolean
+}
+
+// 6 face handles — each constrained to ONE axis, ONE direction
+const HANDLES = [
+  { axis: 0, side: 'min', dir: -1, color: '#ff4444', label: 'X⁻' },  // left face
+  { axis: 0, side: 'max', dir: +1, color: '#ff4444', label: 'X⁺' },  // right face
+  { axis: 1, side: 'min', dir: -1, color: '#44ff44', label: 'Y⁻' },  // front face
+  { axis: 1, side: 'max', dir: +1, color: '#44ff44', label: 'Y⁺' },  // back face
+  { axis: 2, side: 'min', dir: -1, color: '#4488ff', label: 'Z⁻' },  // bottom face
+  { axis: 2, side: 'max', dir: +1, color: '#4488ff', label: 'Z⁺' },  // top face
+] as const
+
+// Each handle renders:
+// - An arrow cone mesh at the face center
+// - Drag gesture constrained to handle's axis via pointer capture
+// - Clamp: Xmin < Xmax - MIN_SIZE (never invert the box)
+// Color coding: X=red, Y=green, Z=blue (standard medical/3D convention)
+```
+
+### SelectPanel Sliders (Context Panel)
+
+```tsx
+// components/sidebar/SelectPanel.tsx
+// Three dual-range sliders, one per axis
+// Each slider has TWO thumbs: min-face and max-face
+
+const axes = [
+  { label: 'X  (Left ↔ Right)',     axis: 0, color: 'text-red-400'   },
+  { label: 'Y  (Anterior ↔ Post.)', axis: 1, color: 'text-green-400' },
+  { label: 'Z  (Inferior ↔ Sup.)',  axis: 2, color: 'text-blue-400'  },
+]
+
+// For each axis, render:
+// <label>  X (Left ↔ Right)  [45 mm … 312 mm]
+// <Slider min={volMin[0]} max={volMax[0]} value={[roi.min[0], roi.max[0]]}
+//         onValueChange={([lo, hi]) => updateROI(0, lo, hi)} />
+// Two number inputs below for precise mm entry
+
+// Total: 6 drag handles in 3D + 6 numeric inputs + 3 dual-range sliders
+// All synchronized via the same Zustand scoutStore.roi state slice
+```
+
+### NiiVue MPR Crop-Plane Lines
+
+NiiVue has no native crop-plane annotation API. We draw lines using a **Canvas 2D overlay** that sits `position: absolute` on top of the NiiVue canvas:
+
+```tsx
+// components/viewport/MPRCropOverlay.tsx
+// Receives roi bbox in world mm; NiiVue exposes mm→pixel via nv.mm2frac() + canvas dims
+
+useEffect(() => {
+  const ctx = overlayCanvas.current.getContext('2d')
+  ctx.clearRect(0, 0, w, h)
+
+  // Axial (XY plane) — scrolling changes Z → draw Zmin / Zmax as horizontal lines
+  const zMinPx = nv.mm2frac([0,0, roiMin[2]])[2] * h
+  const zMaxPx = nv.mm2frac([0,0, roiMax[2]])[2] * h
+  drawDashedLine(ctx, 0, zMinPx, w, zMinPx, '#4488ff')  // Z⁻  blue
+  drawDashedLine(ctx, 0, zMaxPx, w, zMaxPx, '#4488ff')  // Z⁺  blue
+
+  // Coronal (XZ plane) — scrolling changes Y → draw Ymin / Ymax
+  const yMinPx = nv.mm2frac([0, roiMin[1], 0])[1] * h
+  const yMaxPx = nv.mm2frac([0, roiMax[1], 0])[1] * h
+  drawDashedLine(ctx, 0, yMinPx, w, yMinPx, '#44ff44')  // Y⁻  green
+  drawDashedLine(ctx, 0, yMaxPx, w, yMaxPx, '#44ff44')  // Y⁺  green
+
+  // Sagittal (YZ plane) — scrolling changes X → draw Xmin / Xmax as vertical lines
+  const xMinPx = nv.mm2frac([roiMin[0], 0, 0])[0] * w
+  const xMaxPx = nv.mm2frac([roiMax[0], 0, 0])[0] * w
+  drawDashedLine(ctx, xMinPx, 0, xMinPx, h, '#ff4444')  // X⁻  red
+  drawDashedLine(ctx, xMaxPx, 0, xMaxPx, h, '#ff4444')  // X⁺  red
+}, [roiMin, roiMax])
+```
+
+### Zustand State Slice
+
+```ts
+// store/scoutStore.ts
+interface ROIState {
+  min: [number, number, number]   // [Xmin, Ymin, Zmin] in mm
+  max: [number, number, number]   // [Xmax, Ymax, Zmax] in mm
+  locked: boolean
+}
+// Single source of truth — CropBox 3D handles, SelectPanel sliders,
+// and numeric inputs all read/write this same slice
+```
+
+### Axis Color Convention (standard in medical imaging)
+
+| Axis | Color  | MPR view affected       | Handle label  |
+|------|--------|-------------------------|---------------|
+| X    | Red    | Sagittal (YZ plane)     | X⁻ X⁺         |
+| Y    | Green  | Coronal  (XZ plane)     | Y⁻ Y⁺         |
+| Z    | Blue   | Axial    (XY plane)     | Z⁻ Z⁺         |
+
+This matches the left-hand radiological convention used in DICOM, ITK, and NiiVue (RAS orientation).
+
+---
+
+## 10. File Structure
 
 ```
 vsp-engine/
@@ -526,14 +670,15 @@ vsp-engine/
           viewport/         # R3F Canvas, NiiVue integration
              VolumeViewer.tsx       # NiiVue WebGL2 canvas wrapper
              ScoutViewer.tsx        # R3F: per-island threshold meshes (clickable)
-             ROIBox.tsx             # Drei TransformControls crop box
+             ROIBox.tsx             # CropBox: 6 face-center drag handles (X⁻ X⁺ Y⁻ Y⁺ Z⁻ Z⁺), each constrained to its axis
+             MPRCropOverlay.tsx     # Canvas 2D overlay: draws Xmin/Xmax/Ymin/Ymax/Zmin/Zmax dashed lines on NiiVue MPR
              AILabelViewer.tsx      # R3F: per-label AI mesh overlays
              MeshViewer.tsx         # R3F: final export-quality mesh
-             MPRSlices.tsx          # NiiVue MPR with bbox interaction
+             MPRSlices.tsx          # NiiVue MPR slice host canvas
           sidebar/          # Workflow panel steps
              UploadPanel.tsx      # Phase 1: DICOM drag-drop + series browser
              ScoutPanel.tsx       # Phase 2: threshold mesh + island list
-             SelectPanel.tsx      # Phase 3: ROI gizmo + bounding box controls
+             SelectPanel.tsx      # Phase 3: 3 axis range sliders (X/Y/Z, dual-thumb) + 6 numeric mm inputs + Confirm ROI
              AISegmentPanel.tsx   # Phase 4: TotalSegmentator task picker + progress
              RefinePanel.tsx      # Phase 5: SAM-Med3D click / MedSAM bbox
              MeshPanel.tsx        # Phase 6: quality sliders + watertight badge
@@ -541,7 +686,7 @@ vsp-engine/
           ui/               # Shadcn/UI components
        store/                # Zustand slices
           studyStore.ts          # DICOM metadata, upload state
-          scoutStore.ts          # island list, selected islands, ROI box
+          scoutStore.ts          # island list, selected islands, roi:{min:[x,y,z],max:[x,y,z],locked}
           segmentationStore.ts   # AI labels, per-label visibility/color
           meshStore.ts           # final mesh state, quality settings
           viewportStore.ts       # NiiVue state, R3F camera, crosshair
@@ -626,10 +771,14 @@ vsp-engine/
 ### Phase 4: ROI Selection (Week 4)
 
 - [ ] ROI box auto-computed from union of selected island AABBs + 10% padding
-- [ ] R3F `<TransformControls>` gizmo for manual ROI adjustment
-- [ ] SelectPanel: numeric XYZ inputs synced bidirectionally with gizmo
-- [ ] NiiVue: show crop region as highlighted overlay on MPR slices
-- [ ] "Confirm ROI" → lock selection, advance to Phase 5
+- [ ] Custom `<CropBox>` R3F component: 6 face-center drag handles (X⁻ X⁺ Y⁻ Y⁺ Z⁻ Z⁺), each constrained to its own axis only; no Drei TransformControls
+- [ ] Handles color-coded: X=red, Y=green, Z=blue (DICOM/ITK convention)
+- [ ] Clamp logic: Xmin < Xmax - MIN_SIZE for each axis (prevent box inversion)
+- [ ] SelectPanel: 3 dual-range sliders (one per axis, two thumbs each) + 6 numeric mm inputs
+- [ ] All controls bidirectionally synced via `scoutStore.roi` Zustand slice
+- [ ] `MPRCropOverlay.tsx`: Canvas 2D overlay draws 2 dashed crop lines per MPR plane (6 lines total)
+- [ ] Crop lines update in real-time as handles/sliders drag (no "confirm" needed for line preview)
+- [ ] "Confirm ROI" → lock, advance; "Edit ROI" to reopen when locked
 
 ### Phase 5: AI Segmentation on ROI Crop (Week 4–6)
 
