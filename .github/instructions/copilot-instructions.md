@@ -49,23 +49,43 @@ VSP Engine is a virtual surgery planning web platform. It ingests DICOM CT/MR sc
 - Always crop ROI before calling TotalSegmentator to avoid GPU OOM on large volumes
 - After mesh generation always call `topology.isClosed()` before offering STL download
 - Celery tasks: always update task state with `self.update_state(state="PROGRESS", meta={"percent": n})`
+- **Two Celery queues required**: `cpu_queue` (concurrency=4) for scout, scan_qc, mesh tasks; `gpu_queue` (concurrency=1) for segment + refine. Workers bind to named queues. Never run two GPU inference tasks concurrently.
+- **NIfTI is the universal format**: dcm2niix converts DICOM→NIfTI once at upload. All subsequent pipeline stages (NiiVue, MeshLib, TotalSegmentator, SAM-Med3D) read from `volume.nii.gz`. Never re-read DICOM after upload.
+- **MedSAM2 isolation**: MedSAM2 runs in `docker/medsam2/` (separate Dockerfile, `torch==2.5.1`, separate GPU device env var `GPU_DEVICE_MEDSAM2`). Main backend calls it via `POST /medsam2/propagate {study_id, slice_idx, bbox}` over internal network.
+- **appendicular_bones feature gate**: check `TOTALSEG_LICENSE_KEY` env var in `feature_flags.py`; expose `/config/features` endpoint; SelectPanel shows "License required" badge if flag is False; fallback to `total` task.
+- **Coordinate transforms**: all world-space coordinates in VSP Engine use NIfTI RAS mm. R3F scene units = mm, Y = Superior. Conversion helpers live in `frontend/src/lib/coordTransforms.ts` and `backend/app/services/coord_service.py`. SAM-Med3D expects (z_norm, y_norm, x_norm) within the 128³ patch — always use `niftiVoxelToSamMed3dPoint()`. Never guess coordinate order.
+- **Scan QC task** (cpu_queue): runs after upload; checks slice thickness >3mm, z-gap, HU range, isotropy; returns non-blocking warnings to frontend UploadPanel.
+- **Session auth**: every request carries `session_id` (JWT or HttpOnly signed cookie). Backend binds study to session_id; 403 if mismatch. Issue via `/auth/session`.
+- **Chunked upload**: use tus protocol in frontend; `/upload/chunk` + `/upload/finalize` on backend; Nginx `client_max_body_size 1g`.
+- **DICOM series picker**: dcmjs parses series in a WebWorker before upload; show thumbnail grid grouped by SeriesInstanceUID; surgeon selects the correct series.
+- **Error states**: every Zustand slice has `taskStatus: 'idle' | 'running' | 'done' | 'error'` and `errorMessage: string | null`. Each panel shows its own inline error banner (not global toast) with a Retry action.
+- **Multi-structure export**: ExportPanel shows per-label combine/separate toggle. `/mesh/export` supports `union=True` (single STL) and `union=False` (ZIP of per-label STL files).
+- **Measurements**: MeshPanel exposes point-to-point caliper and 3-point angle tools via R3F rayCast. Results stored in `planReportStore`.
+- **Implant overlay**: `Drei TransformControls` is the correct tool for moving implant template STL overlays — NOT for the crop box. Implant transform stored in `implantStore`.
+- **planReportStore**: captures viewport screenshot (`gl.domElement.toDataURL()`), measurement results, surgeon notes, export manifest. "Download Report" → PDF.
+- **Study data TTL**: MinIO lifecycle policy auto-deletes study files after `STUDY_TTL_DAYS` (default 30). Patient data must never persist beyond session.
 - Never log patient PHI; anonymize DICOM tags at ingestion boundary
 
 ### Medical Data / Safety
 
-- All DICOM data must be anonymized at upload — strip patient name, DOB, MRN
-- Add "FOR PLANNING PURPOSES ONLY — NOT FOR DIAGNOSTIC USE" watermark on all exports
+- All DICOM data must be anonymized at upload — strip patient name, DOB, MRN, AccessionNumber, InstitutionName
+- Add "FOR PLANNING PURPOSES ONLY — NOT FOR DIAGNOSTIC USE" watermark on all exports (STL binary header + report PDF)
 - STL files must pass watertight check before download is offered to user
+- All storage must use AES-256 encryption at rest (MinIO SSE-S3 or equivalent)
+- Nginx must terminate TLS; all HTTP redirects to HTTPS in production
+- Audit log: write to `audit_log` Postgres table for every upload, task run, and export (session_id, action, study_id, timestamp — no PHI values)
 
 ### File Structure
 
 ```
 frontend/src/components/viewport/  — R3F + NiiVue components only
 frontend/src/components/sidebar/   — Workflow step panels
-frontend/src/store/                — Zustand slices
+frontend/src/store/                — Zustand slices (all include taskStatus + errorMessage)
+frontend/src/lib/coordTransforms.ts — EXPLICIT coordinate-system transforms (RAS↔voxel↔R3F↔SAM)
 backend/app/routers/               — FastAPI route handlers
-backend/app/services/              — Business logic (dicom, segment, mesh)
-backend/app/tasks/                 — Celery async tasks
+backend/app/services/              — Business logic (dicom, scan_qc, scout, segment, mesh, coord, audit, feature_flags)
+backend/app/tasks/                 — Celery tasks (cpu_queue: scout/scan_qc/mesh; gpu_queue: segment/refine)
+docker/medsam2/                    — Isolated MedSAM2 service (torch==2.5.1, separate GPU)
 ```
 
 ## Key Libraries — Quick Reference
@@ -89,10 +109,16 @@ backend/app/tasks/                 — Celery async tasks
 - Do not use Redux — use Zustand
 - Do not use class components
 - Do not shell out to subprocesses for TotalSegmentator/MONAI/SAM-Med3D/MedSAM — use Python APIs
-- Do not store patient data beyond temporary session storage
+- Do not store patient data beyond temporary session storage (enforce TTL via MinIO lifecycle)
 - Do not skip mesh healing before STL export
 - Do not use `console.log` in production code — use a logger utility
 - **Do not use VISTA3D in any production, commercial, or clinical path** — NVIDIA OneWay Noncommercial License prohibits it
-- **Do not run MedSAM2 in the same Python process or container as TotalSegmentator** — incompatible torch versions (`torch==2.5.1` vs `torch<=2.8.0`)
+- **Do not run MedSAM2 in the same Python process or container as TotalSegmentator** — incompatible torch versions (`torch==2.5.1` vs `torch<=2.8.0`); use `docker/medsam2/` service with internal HTTP API
 - Do not use SuPreM weights in production without verifying the license file ("patents pending" — not a standard OSS license)
 - Do not offer STL download until `topology.isClosed()` returns `True`
+- **Do not re-read DICOM files after upload** — dcm2niix runs once at upload; all pipeline stages use NIfTI
+- **Do not use `Drei TransformControls` for the ROI crop box** — use the custom 6-handle `<CropBox>`. TransformControls is correct ONLY for implant template overlay positioning.
+- Do not guess coordinate axis order — always use `coordTransforms.ts` / `coord_service.py` helpers
+- Do not offer `appendicular_bones` anatomy in the UI without checking the `feature_flags.appendicular_bones` API response
+- Do not skip error state in Zustand slices — every slice must have `taskStatus` and `errorMessage` fields
+- Do not run two GPU inference Celery tasks concurrently — `gpu_queue` must have `concurrency=1`

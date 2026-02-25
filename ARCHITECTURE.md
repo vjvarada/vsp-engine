@@ -51,55 +51,45 @@ The interface must be operable by a non-technical user (surgeon, radiographer). 
 ## 3. System Architecture
 
 ```
-
-                        BROWSER (Client)
-
-
-    React 19 + Vite + TypeScript
-
-
-      Sidebar /            3D Viewport
-      Panel UI       React Three Fiber (R3F) + Drei
-      Shadcn/UI
-      Tailwind        Volume Layer    Mesh Layer
-                      (NiiVue canvas  Three.js geo
-      Workflow         embedded /    STL / OBJ
-      Steps:           WebGL2 ptr)   + seg masks
-      1. Upload
-      2. Segment
-      3. Crop         Crop/ROI Gizmo  (Drei TransCtrl)
-      4. Export
-
-
-    State: Zustand     API Client: TanStack Query + Axios
-
-
-                            HTTPS REST / WebSocket
-
-                     BACKEND (Python)
-
-  FastAPI
-
-   /upload          (DICOM series  NIfTI conversion)
-        pydicom  +  SimpleITK  +  dcm2niix
-
-   /segment         (AI segmentation task  job ID)
-        TotalSegmentator Python API  OR  MONAI Bundle
-        Runs async via Celery + Redis
-
-   /mesh/generate   (voxel mask  mesh)
-        MeshLib Python: marching-cubes, boolean, heal, simplify
-
-   /mesh/crop       (apply ROI bounding box + boolean subtract)
-        MeshLib boolean operations
-
-   /mesh/export     (watertight STL / OBJ / 3MF download)
-        MeshLib  +  numpy-stl
-
-   /jobs/{id}       (SSE / WebSocket progress streaming)
-
-  Storage: MinIO or local filesystem (study DICOM  NIfTI  masks)
-
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         BROWSER  (Client)                                   │
+│                                                                             │
+│  React 19 + Vite + TypeScript  ·  Zustand  ·  TanStack Query               │
+│                                                                             │
+│  4-Column AppShell  (adapted from RapidTool-Fixture)                        │
+│  ┌──────────┬─────────────────────┬───────────────────────┬──────────────┐  │
+│  │Toolbar   │ Context Panel       │ 3D Viewport           │ Properties   │  │
+│  │(icons)   │ (workflow steps)    │                       │ Panel        │  │
+│  │📥 Upload │  UploadPanel        │  NiiVue WebGL2        │              │  │
+│  │🔍 Scout  │  ScoutPanel         │  volume renderer      │  Study info  │  │
+│  │🎯 Select │  SelectPanel        │  ─────────────────    │  Masks       │  │
+│  │🤖 AI Seg │  AISegmentPanel     │  R3F mesh layer:      │  ROI/Crop    │  │
+│  │✏️ Refine │  RefinePanel        │  · scout islands      │  Mesh        │  │
+│  │⚙️ Mesh   │  MeshPanel          │  · AI label meshes    │  Implants    │  │
+│  │💾 Export │  ExportPanel        │  · 6-handle CropBox   │              │  │
+│  └──────────┴─────────────────────┴───────────────────────┴──────────────┘  │
+│                                                                             │
+│  session_id (JWT/signed cookie) bound to every request                     │
+│  DICOM series picker → chunked upload → NIfTI (universal format)            │
+└─────────────────────────────────────────────────────────────────────────────┘
+                          HTTPS (TLS required in prod)
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         BACKEND  (Python FastAPI)                           │
+│                                                                             │
+│  /upload      pydicom → PHI strip → dcm2niix → NIfTI → scan_qc task         │
+│  /scout       MeshLib  HU-threshold → connected-component islands  (CPU)    │
+│  /segment     TotalSegmentator on cropped ROI volume  (gpu_queue)           │
+│  /refine      SAM-Med3D-turbo 3D click  |  MedSAM 2D bbox  (gpu_queue)      │
+│  /mesh        MeshLib Pass B: repair → watertight → multi/single export     │
+│  /jobs/{id}   SSE progress stream per Celery task                           │
+│                                                                             │
+│  Celery workers:                                                            │
+│    cpu_queue  (concurrency=4)  → scout, scan_qc, mesh generation            │
+│    gpu_queue  (concurrency=1)  → segment, refine  (VRAM serialized)         │
+│                                                                             │
+│  Storage: MinIO (AES-256 SSE-S3)  |  Redis (task state + session cache)     │
+│  Audit log: postgres audit_log table — every task + export timestamped      │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -130,7 +120,7 @@ The interface must be operable by a non-technical user (surgeon, radiographer). 
 | DICOM I/O                | **pydicom + SimpleITK + dcm2niix**   | Battle-tested DICOM→NIfTI pipeline. **Pin `SimpleITK==2.0.2`** (TotalSegmentator hard requirement)                                                                                                                                                                                                                                                               |
 | AI Segmentation (Tier 2 — Auto)   | **TotalSegmentator v2**              | 117-class CT segmentation. Python API: `totalsegmentator(input_img, task="total", roi_subset=[...], fast=True, device="gpu")`. **Pin `torch<=2.8.0`** — nnU-Net has severe 3D conv regression in torch ≥ 2.9.0. `appendicular_bones` subtask requires commercial license; default `total` task covers femur, tibia, humerus, hip, ribs, sternum, skull for free. 2025 new subtasks: `craniofacial_structures` (mandible, teeth, skull, sinuses), `teeth` (FDI notation, CVPR 2025), `trunk_cavities`. |
 | AI Segmentation (Tier 3 — Interactive 3D) | **SAM-Med3D-turbo** (Apache 2.0) | Surgeon clicks 3D point in R3F viewport → backend runs `medim.create_model("SAM-Med3D", pretrained=True)` → returns binary 3D mask. 10–100× fewer prompts than 2D SAM. Install: `pip install medim`. |
-| AI Segmentation (Tier 4 — Interactive 2D) | **MedSAM / LiteMedSAM** (Apache 2.0) | Surgeon draws 2D bbox on NiiVue MPR slice → MedSAM inference on single slice → stack across z → 3D mask. Use for unknown structures not in TotalSegmentator's 117 classes. |
+| AI Segmentation (Tier 4 — Interactive 2D) | **MedSAM / LiteMedSAM** (Apache 2.0) | Surgeon draws 2D bbox on NiiVue MPR slice → MedSAM inference on single slice → stack across z → 3D mask. Use for unknown structures not in TotalSegmentator's 117 classes. **MedSAM2** (requires `torch==2.5.1`) must run in a **separate Docker service** (`medsam2/`) and is accessed via internal HTTP call from the main backend — never imported in the same process as TotalSegmentator. API contract: `POST /medsam2/propagate {study_id, slice_idx, bbox}` → `{mask_nifti_url}`. GPU allocation: separate device (`GPU_DEVICE_MEDSAM2=cuda:1`) or time-shared with a VRAM guard. |
 | AI Segmentation (Tier 5 — Custom Fine-tune) | **STU-Net-B + nnU-Net v2** (Apache 2.0) | Hospital provides annotated bone CTs → fine-tune STU-Net-B (58M params, 59-bone pre-trained) via `run_finetuning.py`. Alternatively: Auto3DSeg AutoRunner for ensemble training. MedNeXt-L k5 for <200 case datasets. |
 | AI Segmentation Fallback (Tier 1) | **MeshLib VDB + Otsu threshold**     | Two-mode pipeline: if AI unavailable or user wants fast preview, load DICOM directly via `mr.VoxelsLoad.loadDicomsFolderTreeAsVdb()` and run marching cubes at Otsu-determined HU threshold. Completes in <5 s vs 30–300 s for AI. |
 | AI Segmentation (custom bundles)  | **MONAI + nnU-Net + Auto3DSeg**      | For additional fine-grained tasks (craniofacial, teeth, appendicular bones) or fine-tuning on specific anatomy. Auto3DSeg AutoRunner for ensemble training: `python -m monai.apps.auto3dseg AutoRunner run --input='./task.yaml'`. |
@@ -179,9 +169,9 @@ All panels use `tech-glass` (backdrop-blur + semi-transparent border + bg-backgr
 │ 🎯 │  │ + StepProgress  │    │                          │  ├──────────┤  │
 │    │  └─────────────────┘    │  overlaid with R3F       │  │ Masks    │  │
 │ ✂️  │  ┌─────────────────┐    │  ┌────────────────────┐  │  ├──────────┤  │
-│    │  │ Step content    │    │  │ ROI Bounding Box   │  │  │ ROI /    │  │
-│ ⚙️  │  │ (per step)      │    │  │ (Drei Transform-   │  │  │ Crop     │  │
-│    │  └─────────────────┘    │  │  Controls gizmo)   │  │  ├──────────┤  │
+│    │  │ Step content    │    │  │ ROI Box: 6-handle  │  │  │ ROI /    │  │
+│    │  │ (per step)      │    │  │ CropBox, per-axis  │  │  │ Crop     │  │
+│    │  └─────────────────┘    │  │  drag (X⁻X⁺Y⁻Y⁺Z⁻Z⁺)  │  ├──────────┤  │
 │ 💾 │  ───────────────────    │  └────────────────────┘  │  │ Mesh     │  │
 │    │  [🔼 🧩 🎯 ✂️ ⚙️ 💾]    │                          │  └──────────┘  │
 │    │  mini-map step row      │  [floating tips overlay] │                │
@@ -235,32 +225,65 @@ The workflow is designed so the surgeon sees *something* in under 10 seconds and
 ## 6. Data Flow — Scout → Select → AI → Refine → Export
 
 ```
-── PHASE 1: LOAD ──────────────────────────────────────── ~2–5 s ──
+── PHASE 1: LOAD ──────────────────────────────────────── ~5–15 s ──
 
-CLIENT:  DICOM ZIP drag-drop
-         dcmjs → group by SeriesInstanceUID → series thumbnail grid
-         User picks CT series → upload to /upload
+CLIENT (series picker):
+         DICOM drag-drop (folder or ZIP)
+         dcmjs → parse all DICOM files in a WebWorker
+         → group by SeriesInstanceUID → display series grid:
+             thumbnail (first-slice canvas), SeriesDescription,
+             slice count, voxel spacing, modality (CT/MR)
+         Surgeon selects the correct series (bone kernel, non-contrast CT)
+         ↓ Validate: warn if slice thickness > 3 mm or modality ≠ CT
 
-BACKEND /upload:
-         pydicom → strip PHI (name, DOB, MRN, StudyID)
-         SimpleITK / dcm2niix → NIfTI (.nii.gz)
-         Store: MinIO study/{id}/volume.nii.gz
-         Return: {study_id, dims, spacing, HU_min, HU_max, nifti_url}
+CLIENT (chunked upload):
+         Selected series files → chunked upload via tus protocol
+         Chunk size: 5 MB; show progress bar
+         POST /upload/chunk {chunk_index, total_chunks, study_id}
+         POST /upload/finalize {study_id} when all chunks received
 
-CLIENT:  NiiVue attaches to canvas, loads volume URL
-         → CT renders immediately; surgeon sees the scan
+CLIENT (auth):
+         Every request includes session_id (JWT in Authorization header
+         or HttpOnly signed cookie). Issued by /auth/session on first visit.
+         Backend binds study to session_id — cross-session access returns 403.
+
+BACKEND /upload/finalize:
+         Assert session_id ownership of study_id
+         pydicom → strip PHI (PatientName, PatientID, DOB, AccessionNumber,
+                               InstitutionName, ReferringPhysicianName)
+         dcm2niix → NIfTI (.nii.gz) with preserved voxel spacing + orientation
+         Store: MinIO study/{id}/volume.nii.gz  (AES-256 SSE-S3)
+         Enqueue scan_qc Celery task (cpu_queue)
+         Return: {study_id, nifti_url, qc_task_id}
+
+BACKEND /jobs/scan_qc (Celery cpu_queue, ~2 s):
+         Check slice thickness (warn if > 3 mm)
+         Check voxel spacing isotropy (warn if z-spacing > 2× xy-spacing)
+         Check HU range (−1000 to 3000 expected for CT)
+         Check volume coverage (number of slices, gap detection)
+         Return: {warnings: [], ready: true}
+         Frontend shows warning banner if any warnings — non-blocking
+
+CLIENT:  NiiVue attaches to canvas, loads NIfTI URL
+         → CT renders immediately; scan QC warnings shown in UploadPanel
+         → surgeon acknowledges warnings, proceeds to Scout
 
 
 ── PHASE 2: SCOUT ─────────────────────────────────────── ~5–10 s ──
 
-BACKEND /scout (fast Celery task, Tier 1):
-         MeshLib: VoxelsLoad.loadDicomsFolderTreeAsVdb()
-                  OR SimpleGrid from NIfTI voxel array
-         marchingCubesFloat(vdb, iso=300)           ← bone HU ~300
-         removeSmallComponents(mesh, minVol=50)      ← remove noise
-         findConnectedComponents(mesh)               ← per-island IDs
-         Each island → separate .ply blob + centroid + AABB
+BACKEND /scout (fast Celery task, Tier 1 — cpu_queue):
+         # NIfTI-primary path: volume.nii.gz is the universal format.
+         # dcm2niix runs once at upload; all downstream tools (NiiVue,
+         # TotalSegmentator, MeshLib, SAM-Med3D) consume the same NIfTI.
+         # Never re-read DICOM during scout or segment phases.
+         vox = mr.loadVoxels("volume.nii.gz")       ← NIfTI, already converted
+         mesh = mr.marchingCubesFloat(vox.data, mr.MarchingCubesParams(300.0))  # bone HU ~300
+         mr.removeSmallComponents(mesh, minVolumeVerts=50)  ← remove noise
+         components = mr.getAllComponents(mesh)             ← per-island split
+         # Each component in world-mm coordinates (NIfTI affine preserves spacing)
+         Each island → separate .ply blob + centroid_xyz (world mm) + AABB (world mm) + voxel_count
          Return: [{island_id, centroid_xyz, aabb, ply_url, voxel_count}, …]
+         # centroid_xyz is in NIfTI RAS world space — used later for TotalSegmentator task routing
 
 CLIENT:  R3F loads each island PLY as a separate <mesh>
          Color per island (medical colormap, 20 colors cycling)
@@ -365,11 +388,35 @@ CLIENT:  STLLoader → R3F mesh preview (replace scout clouds)
          Orbit / pan / zoom; per-label color; show/hide toggles
 
 
-── PHASE 7: EXPORT ───────────────────────────────────────── instant ──
+── PHASE 7: EXPORT ───────────────────────────────────────── 2–10 s ──
 
-CLIENT:  Select format (STL / OBJ / 3MF), scale (1:1 / ×2 / ×0.5)
-         "FOR PLANNING PURPOSES ONLY" watermark embedded in metadata
-         Download via signed MinIO URL
+CLIENT (ExportPanel — multi-structure tree):
+         Each AI label is shown as a tree row:
+           [☑] femur_left      [◉ combined | ○ separate]
+           [☑] tibia_left      [◉ combined | ○ separate]
+           [☐] fibula_left     (deselected — not included)
+         Surgeon chooses per-label: merge into combined STL or export as
+         individual file. Entire selection → POST /mesh/export
+
+         Format selector: STL / OBJ / 3MF
+         Scale selector: 1:1 / ×2 / ×0.5
+
+BACKEND /mesh/export:
+         If all selected labels → union=True: boolean union → single .stl
+         If any label marked separate: union=False → ZIP of per-label .stl files
+           each named {label_name}_{study_id}_{timestamp}.stl
+         Embed "FOR PLANNING PURPOSES ONLY — NOT FOR DIAGNOSTIC USE" in STL header
+         Log to audit_log: {session_id, study_id, labels, format, timestamp}
+         Return: signed MinIO URL (15-min expiry)
+
+CLIENT (case report):
+         planReport Zustand slice captures:
+           - viewport screenshot (gl.domElement.toDataURL()) at Export step
+           - list of exported structures + file names
+           - any measurements taken (caliper distances / angles)
+           - surgeon notes (free text input in ExportPanel)
+         "Download Report" → browser window.print() on styled report page
+           (or pdfmake for programmatic PDF generation)
 ```
 
 ---
@@ -638,14 +685,34 @@ useEffect(() => {
 
 ```ts
 // store/scoutStore.ts
+type TaskStatus = 'idle' | 'running' | 'done' | 'error'
+
 interface ROIState {
-  min: [number, number, number]   // [Xmin, Ymin, Zmin] in mm
+  min: [number, number, number]   // [Xmin, Ymin, Zmin] in mm (NIfTI RAS world space)
   max: [number, number, number]   // [Xmax, Ymax, Zmax] in mm
   locked: boolean
 }
-// Single source of truth — CropBox 3D handles, SelectPanel sliders,
-// and numeric inputs all read/write this same slice
+
+interface ScoutState {
+  taskStatus: TaskStatus
+  errorMessage: string | null     // shown in ScoutPanel error banner on 'error'
+  islands: IslandMeta[]
+  selectedIds: Set<string>
+  roi: ROIState
+}
+
+// All other task slices follow the same error pattern:
+// segmentationStore: { taskStatus, errorMessage, labels, ... }
+// meshStore:         { taskStatus, errorMessage, meshUrl, quality, ... }
+// studyStore:        { taskStatus, errorMessage, study, qcWarnings, ... }
+
+// Error UX rule: each panel shows its own inline error banner
+// (not a global toast) with a "Retry" action that re-queues the same task.
+// If AI segment fails, surgeon can still proceed to Phase 7 with scout meshes.
 ```
+
+// Single source of truth — CropBox 3D handles, SelectPanel sliders,
+// and numeric inputs all read/write the same scoutStore.roi slice
 
 ### Axis Color Convention (standard in medical imaging)
 
@@ -685,13 +752,16 @@ vsp-engine/
              ExportPanel.tsx      # Phase 7: format / scale / download
           ui/               # Shadcn/UI components
        store/                # Zustand slices
-          studyStore.ts          # DICOM metadata, upload state
-          scoutStore.ts          # island list, selected islands, roi:{min:[x,y,z],max:[x,y,z],locked}
-          segmentationStore.ts   # AI labels, per-label visibility/color
-          meshStore.ts           # final mesh state, quality settings
+          studyStore.ts          # DICOM metadata, upload state, qcWarnings, session_id
+          scoutStore.ts          # island list, selected islands, roi:{min:[x,y,z],max:[x,y,z],locked}, taskStatus+errorMessage
+          segmentationStore.ts   # AI labels, per-label visibility/color, taskStatus+errorMessage
+          meshStore.ts           # final mesh state, quality settings, taskStatus+errorMessage
           viewportStore.ts       # NiiVue state, R3F camera, crosshair
+          planReportStore.ts     # viewport screenshots, measurements, surgeon notes, export manifest
+          implantStore.ts        # uploaded implant template STL refs, per-implant transform matrix
        hooks/                # TanStack Query hooks
        lib/                  # dcmjs helpers, API client
+          coordTransforms.ts  # EXPLICIT coordinate-system transforms (see Section 15)
        types/
     public/
     index.html
@@ -710,25 +780,33 @@ vsp-engine/
           mesh.py           # POST /mesh/generate  GET /mesh/export
           jobs.py           # GET /jobs/{id}  SSE progress
        services/
-          dicom_service.py  # pydicom + SimpleITK + dcm2niix
-          scout_service.py  # MeshLib HU threshold + connected components
-          segment_service.py # TotalSegmentator + task routing
-          refine_service.py  # SAM-Med3D-turbo + MedSAM
-          mesh_service.py   # MeshLib Pass B (final mesh)
-       tasks/                # Celery tasks
-          scout_task.py
-          segment_task.py
-          refine_task.py
-          mesh_task.py
-       models/               # Pydantic schemas
+          dicom_service.py    # pydicom + SimpleITK + dcm2niix + PHI strip
+          scan_qc_service.py  # slice-thickness, spacing, HU-range, gap checks
+          scout_service.py    # MeshLib HU threshold + connected components (NIfTI input)
+          segment_service.py  # TotalSegmentator + task routing
+          refine_service.py   # SAM-Med3D-turbo + MedSAM (local); MedSAM2 via HTTP to medsam2 service
+          mesh_service.py     # MeshLib Pass B: repair → watertight → union/separate export
+          coord_service.py    # coordinate-system transform helpers (see Section 15)
+          audit_service.py    # write to audit_log: task runs, exports, session events
+          feature_flags.py    # appendicular_bones license check, MedSAM2 availability flag
+       tasks/                 # Celery tasks
+          scan_qc_task.py     # cpu_queue
+          scout_task.py       # cpu_queue
+          segment_task.py     # gpu_queue (concurrency=1)
+          refine_task.py      # gpu_queue (concurrency=1)
+          mesh_task.py        # cpu_queue
+       models/                # Pydantic v2 schemas
        config.py
     requirements.txt
     Dockerfile
 
  docker/
     docker-compose.yml
-    docker-compose.gpu.yml    # GPU override
-    nginx.conf
+    docker-compose.gpu.yml    # GPU override (nvidia runtime, gpu_queue worker)
+    medsam2/                  # isolated service: torch==2.5.1, separate GPU device
+       Dockerfile
+       main.py                # FastAPI: POST /medsam2/propagate
+    nginx.conf                # includes ssl_certificate block; client_max_body_size 1g
 
  .env.example
  .github/
@@ -746,9 +824,16 @@ vsp-engine/
 - [ ] Monorepo setup: `pnpm workspace` + Python `uv` environment
 - [ ] Frontend scaffold: Vite + React + TypeScript + Tailwind + Shadcn/UI init
 - [ ] Backend scaffold: FastAPI + Celery + Redis docker-compose
-- [ ] Basic DICOM upload endpoint: pydicom → dcm2niix → NIfTI conversion
-- [ ] File storage service (local FS with MinIO abstraction)
-- [ ] DICOM drop zone + series browser in frontend; DICOM tag preview
+- [ ] Two Celery queues: `cpu_queue` (concurrency=4) and `gpu_queue` (concurrency=1, GPU workers only)
+- [ ] Session auth: `/auth/session` issues signed JWT; all endpoints enforce session→study ownership
+- [ ] DICOM series picker: WebWorker dcmjs parse → SeriesInstanceUID groups → thumbnail grid UI
+- [ ] Chunked upload via tus protocol: `/upload/chunk` + `/upload/finalize` endpoints; Nginx `client_max_body_size 1g`
+- [ ] PHI anonymization at finalize: PatientName, PatientID, DOB, AccessionNumber, InstitutionName stripped
+- [ ] dcm2niix → NIfTI conversion; NIfTI is the universal format for all downstream tools
+- [ ] Scan QC Celery task (cpu_queue): slice thickness, spacing, HU range, z-gap checks → warning list
+- [ ] File storage service: MinIO with SSE-S3 encryption; local FS fallback for dev
+- [ ] Audit log: `audit_log` Postgres table — session_id, action, study_id, timestamp (no PHI)
+- [ ] Nginx config: TLS termination block (self-signed for dev, Let's Encrypt hook for prod)
 
 ### Phase 2: Volume Viewer (Week 2–3)
 
@@ -805,19 +890,28 @@ vsp-engine/
 - [ ] Mesh quality UI: Preview / Standard / High Detail decimation presets
 - [ ] Shell / hollow offset for surgical guide models
 - [ ] Watertight badge (`topology.isClosed()`) — blocks download if False
-- [ ] STL/OBJ/3MF download with planning watermark metadata
+- [ ] Multi-structure export tree in ExportPanel: per-label combine/separate toggle
+- [ ] `/mesh/export`: `union=True` → single STL; `union=False` → ZIP of per-label STL files
+- [ ] Measurement tools in MeshPanel: point-to-point caliper (two R3F rayCast picks → world distance mm); 3-point angle measurement; results shown in viewport labels and saved to planReportStore
+- [ ] Export watermark: "FOR PLANNING PURPOSES ONLY — NOT FOR DIAGNOSTIC USE" in STL binary header comment
+- [ ] Audit log entry for every export: session_id, label list, format, timestamp
+- [ ] Case report: planReport Zustand slice → viewport screenshot + measurements + surgeon notes → "Download Report" PDF
 - [ ] MeshPanel + ExportPanel
 
 ### Phase 8: Polish & Clinical UX (Week 8–10)
 
 - [ ] Study management: patient list, past exports, session restore
-- [ ] Robust error handling: corrupt DICOM, low-res scan warnings, OOM recovery
+- [ ] Robust error handling: each panel shows inline error banner + Retry; AI failure → fallback to scout meshes for export path
 - [ ] AI weight pre-download on Docker build (`totalseg_download_weights`)
 - [ ] `segmentation_ready` Redis flag → "AI loading…" overlay if weights not ready
 - [ ] Scout works without AI ready — surgeon can proceed to Phase 4 while AI loads
-- [ ] Performance: WebWorker for DICOM parsing, lazy R3F asset loading
+- [ ] `appendicular_bones` license feature flag: `feature_flags.py` returns `{tibia: false, fibula: false}` if license absent; SelectPanel shows "License required" badge on affected anatomy; gracefully falls back to `total` task
+- [ ] Implant overlay (basic): upload reference STL (implant template) → rendered in R3F alongside patient mesh; translate/rotate with `Drei TransformControls` (this is the correct use for TransformControls — on implant template, not on crop box); implant transform stored in implantStore
+- [ ] MedSAM2 Docker service (`docker/medsam2/`): isolated `torch==2.5.1` environment; internal `POST /medsam2/propagate` API; GPU device assignment (`GPU_DEVICE_MEDSAM2`)
+- [ ] Study data TTL: MinIO lifecycle policy — auto-delete study data after 30 days; configurable via env var `STUDY_TTL_DAYS`
+- [ ] Performance: WebWorker for DICOM series parsing; lazy R3F asset loading; NiiVue canvas cleanup on step unmount
 - [ ] Unit + integration tests (Vitest frontend, pytest backend)
-- [ ] Docker Compose GPU single-command deploy
+- [ ] Docker Compose GPU single-command deploy; Nginx SSL block with self-signed-cert dev helper
 
 ---
 
@@ -893,14 +987,41 @@ VITE_WS_URL=ws://localhost:8000
 
 ---
 
-## 13. Regulatory Considerations
+## 13. Regulatory & Security Considerations
 
 > **This is a research/planning tool, not a certified medical device (yet).** TotalSegmentator explicitly states it is "not a medical device." Any clinical use requires additional validation.
 
-- Label all outputs with: "FOR PLANNING PURPOSES ONLY — NOT FOR DIAGNOSTIC USE"
-- Anonymize DICOM data at upload (remove patient PHI from tags)
-- Audit trail: log all segmentation runs and mesh exports with timestamps
-- Plan for FDA 510(k) / CE marking pathway if commercializing
+### Output Labeling
+- All STL/OBJ/3MF exports: embed "FOR PLANNING PURPOSES ONLY — NOT FOR DIAGNOSTIC USE" in file metadata
+- All report PDFs: watermark on every page
+
+### PHI / HIPAA
+- Anonymize at upload boundary: strip PatientName, PatientID, DOB, AccessionNumber, InstitutionName, ReferringPhysicianName
+- Never log any DICOM tag values — audit log records actions only (session_id, study_id UUID, timestamp)
+- Study data TTL: auto-delete from MinIO after configurable retention period (default 30 days)
+- Session isolation: every API endpoint verifies `study.session_id == request.session_id`; 403 on mismatch
+
+### Security
+- **TLS required in production**: Nginx terminates HTTPS; all traffic over HTTP redirects to HTTPS
+- **Encryption at rest**: MinIO SSE-S3 (AES-256) for all study NIfTI, segmentation masks, and mesh files
+- **Session tokens**: HttpOnly signed cookie or short-lived JWT (24h expiry); refreshed on activity
+- **Nginx limits**: `client_max_body_size 1g`; rate limiting on `/upload` and `/segment` endpoints
+
+### Audit Trail
+- `audit_log` Postgres table: `{id, session_id, action, study_id, labels, format, timestamp}`
+- Actions logged: upload_complete, scout_run, segment_run, refine_click, mesh_generate, mesh_export
+- Exportable as CSV for institutional compliance review
+
+### License Gating
+- `appendicular_bones` subtask (tibia, fibula, patella, carpals): requires TotalSegmentator commercial license
+- `feature_flags.py` checks `TOTALSEG_LICENSE_KEY` env var at startup → sets `features.appendicular_bones = True/False`
+- Frontend queries `/config/features` on load; SelectPanel gates affected anatomy with "License required" badge
+- Graceful fallback: `total` task covers femur, tibia (less precise), hip — usable without license for most cases
+
+### Regulatory Pathway
+- Plan for FDA 510(k) / CE Class IIa pathway if commercializing
+- Predicate device candidates: Materialise Mimics (FDA cleared), Synopsys Simpleware ScanFE
+- Required for clinical use: IEC 62304 software lifecycle documentation, IEC 62366 usability testing, HIPAA BAA with hosting provider
 
 ---
 
@@ -909,6 +1030,90 @@ VITE_WS_URL=ws://localhost:8000
 1. **Initialize monorepo** with `pnpm` workspaces + Python `uv`
 2. **Scaffold frontend** with `pnpm create vite frontend -- --template react-ts`
 3. **Scaffold backend** with FastAPI + Celery + Redis docker-compose
-4. **Install and verify** TotalSegmentator on a test CT NIfTI file
-5. **Prototype NiiVue** integration inside a React functional component
-6. **Wire up** first complete path: DICOM upload NIfTI NiiVue display
+4. **Configure two Celery queues** (`cpu_queue` + `gpu_queue`) in `config.py` and docker-compose
+5. **Install and verify** TotalSegmentator on a test CT NIfTI file
+6. **Prototype NiiVue** integration inside a React functional component
+7. **Wire up** first complete path: DICOM series picker → chunked upload → NIfTI → scan_qc → NiiVue display
+8. **Add session auth stub**: `/auth/session` endpoint + session_id binding on `/upload`
+
+---
+
+## 15. Coordinate System Reference
+
+Every spatial boundary in VSP Engine crosses multiple coordinate frames. Bugs here cause mirrored meshes, wrong-axis crop lines, and misaligned SAM-Med3D clicks. This section is the single source of truth.
+
+### Frame Definitions
+
+| Frame | Origin | Axes | Used By |
+|---|---|---|---|
+| **DICOM Image** | Top-left of first slice | Row / Col / Slice (image space) | pydicom pixel arrays |
+| **DICOM Patient (LPS)** | Center of scanner bore | L=Left, P=Posterior, S=Superior | DICOM Position/Orientation tags |
+| **NIfTI RAS (world mm)** | per qform/sform affine | R=Right, A=Anterior, S=Superior | NiiVue, SimpleITK, TotalSegmentator, SAM-Med3D |
+| **MeshLib world (mm)** | Matches NIfTI affine when loaded via `mr.loadVoxels()` | R/A/S world mm | Scout PLY meshes, CropBox min/max |
+| **Three.js / R3F** | User defined; we set it = NIfTI RAS mm | Y-up right-hand | R3F viewport, CropBox handles, rayCast results |
+| **NiiVue canvas pixel** | Top-left of NiiVue canvas | x=right, y=down (px) | MPRCropOverlay Canvas2D |
+| **SAM-Med3D input** | Normalized [0,1] within the 128³ patch | d/h/w (z,y,x order) | `/refine/point` backend |
+
+### Key Transforms
+
+```
+DICOM LPS  →  NIfTI RAS:   flip L→R and P→A  (R = −L, A = −P, S = S)
+NIfTI RAS  →  R3F world:   direct (we set R3F scene units = mm, Y=S=Superior)
+R3F world  →  SAM-Med3D:   (x_world, y_world, z_world) → crop to patch →
+                             normalize to [0,1] → reorder to (z_norm, y_norm, x_norm)
+NIfTI RAS mm → NiiVue canvas px:  nv.mm2frac(mmXYZ) → [0,1] fraction →
+                             multiply by canvas width/height
+```
+
+### Implementation
+
+```ts
+// frontend/src/lib/coordTransforms.ts
+// All world-space coordinates in VSP Engine use NIfTI RAS mm.
+// R3F scene is initialized with this same frame (no additional transform needed
+// if MeshLib PLY meshes are loaded directly from NIfTI voxels).
+
+export function r3fWorldToNiftiVoxel(
+  worldMm: [number, number, number],
+  affineInv: number[][]  // 4×4 inverse of NIfTI qform affine
+): [number, number, number] {
+  // affineInv transforms RAS mm → voxel IJK
+  const [i, j, k] = applyAffine(affineInv, worldMm)
+  return [Math.round(i), Math.round(j), Math.round(k)]
+}
+
+export function niftiVoxelToSamMed3dPoint(
+  voxelIJK: [number, number, number],
+  cropOrigin: [number, number, number],  // voxel origin of ROI crop
+  cropSize: [number, number, number]     // voxel size of ROI crop
+): [number, number, number] {
+  // SAM-Med3D expects normalized (z, y, x) within the 128³ patch
+  const [i, j, k] = voxelIJK
+  const [oi, oj, ok] = cropOrigin
+  const [si, sj, sk] = cropSize
+  return [(k - ok) / sk, (j - oj) / sj, (i - oi) / si]  // z,y,x norm
+}
+```
+
+```python
+# backend/app/services/coord_service.py
+import numpy as np, SimpleITK as sitk
+
+def world_mm_to_voxel_index(image: sitk.Image,
+                             world_mm: tuple[float, float, float]) -> tuple[int, int, int]:
+    """Convert NIfTI RAS world-space mm to voxel index (i,j,k).
+    SimpleITK uses LPS internally; negate X and Y for RAS input.
+    """
+    lps = (-world_mm[0], -world_mm[1], world_mm[2])   # RAS → LPS
+    idx = image.TransformPhysicalPointToIndex(lps)
+    return tuple(idx)
+
+def voxel_to_sam_med3d_point(voxel_ijk: tuple[int,int,int],
+                              crop_origin: tuple[int,int,int],
+                              crop_size: tuple[int,int,int]) -> tuple[float,float,float]:
+    """Normalize voxel within ROI crop and reorder to SAM-Med3D (z,y,x)."""
+    i, j, k = voxel_ijk
+    oi, oj, ok = crop_origin
+    si, sj, sk = crop_size
+    return ((k-ok)/sk, (j-oj)/sj, (i-oi)/si)  # z_norm, y_norm, x_norm
+```
