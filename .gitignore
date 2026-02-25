@@ -1,0 +1,93 @@
+﻿# ============================================================
+# VSP Engine — .gitignore
+# ============================================================
+
+# --- CRITICAL: Never commit patient / medical data ---
+*.dcm
+*.dicom
+data/
+/data/
+studies/
+/studies/
+uploads/
+/uploads/
+**/*.nii
+**/*.nii.gz
+**/*.mha
+**/*.mhd
+**/*.nrrd
+
+# --- AI model weights (very large, download on first run) ---
+models/
+/models/
+*.pth
+*.onnx
+*.pt
+*.safetensors
+.totalsegmentator/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+.env
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+*.cover
+pip-log.txt
+
+# --- Node / pnpm / Vite build ---
+node_modules/
+dist/
+.pnpm-store/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+.turbo/
+
+# --- Docker ---
+docker-compose.override.yml
+
+# --- IDE ---
+.vscode/settings.json.local
+.idea/
+*.swp
+*.swo
+*.DS_Store
+Thumbs.db
+
+# --- Environment ---
+.env
+.env.local
+.env.*.local
+
+# --- Redis dumps ---
+dump.rdb
+
+# --- MinIO local storage ---
+minio-data/
+
+# --- Celery ---
+celerybeat-schedule
+celerybeat.pid
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Temp / scratch ---
+tmp/
+temp/
+scratch/

@@ -1,0 +1,47 @@
+﻿name: Bug Report
+description: Report a bug or unexpected behaviour
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **VSP Engine — Bug Report**
+        Please fill in as much as you can. Never include real patient DICOM data.
+  - type: textarea
+    id: desc
+    attributes:
+      label: What happened?
+      placeholder: Describe the bug clearly.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open the app
+        2. Upload a sample DICOM series
+        3. Click "Segment"
+        4. See error
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+  - type: dropdown
+    id: seg_mode
+    attributes:
+      label: Segmentation mode
+      options: [AI (TotalSegmentator), Fast (HU threshold), Not applicable]
+  - type: dropdown
+    id: gpu
+    attributes:
+      label: GPU available?
+      options: [Yes (CUDA), No (CPU only), Unknown]
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / console output
+      render: shell
