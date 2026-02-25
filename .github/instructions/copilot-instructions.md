@@ -20,7 +20,8 @@ VSP Engine is a virtual surgery planning web platform. It ingests DICOM CT/MR sc
 
 ### TypeScript / React
 
-- Always use strict TypeScript — no `any`, no implicit `any`
+#### Domain rules
+- Always use strict TypeScript — no `any`, no implicit `any`. Use `unknown` + type guard instead.
 - Prefer functional components with hooks; no class components
 - Use Zustand slices for global state — avoid prop drilling > 2 levels
 - React Three Fiber: use declarative JSX geometry (`<mesh>`, `<boxGeometry>`) not imperative Three.js
@@ -29,10 +30,53 @@ VSP Engine is a virtual surgery planning web platform. It ingests DICOM CT/MR sc
 - **ROI Panel: 3 dual-range sliders** (one per axis, two thumbs) + 6 numeric mm inputs, all synced to `scoutStore.roi` — not just a single XYZ triplet
 - **MPR crop lines: Canvas 2D overlay** drawn on top of NiiVue canvas (position: absolute). Axial MPR shows Z⁻/Z⁺ blue lines; Coronal shows Y⁻/Y⁺ green; Sagittal shows X⁻/X⁺ red. Use `nv.mm2frac()` to convert world mm to canvas pixel positions.
 - NiiVue: always wrap in a `useEffect` with cleanup to call `nv.dispose()` on unmount
-- File naming: PascalCase for components, camelCase for hooks (useMyHook.ts), kebab-case for utils
+
+#### Naming
+- Components: PascalCase (`ScoutPanel`, `CropBox`). Hooks: `usePrefix` camelCase (`useScoutIslands`). Event handlers: `handle` prefix (`handleIslandClick`). Booleans: `is`/`has`/`can` prefix (`isLocked`, `canExport`). Module constants: SCREAMING_SNAKE_CASE (`MIN_ROI_SIZE_MM`). Utility files: kebab-case (`coord-transforms.ts`).
+
+#### TypeScript strictness
+- `tsconfig.json`: `strict: true`, `exactOptionalPropertyTypes: true`, `noUncheckedIndexedAccess: true`, `noImplicitReturns: true`
+- Use `satisfies` to validate config object shape without widening the type
+- `interface` for public API contracts; `type` for unions, mapped types, intersections
+- `import type { ... }` for all type-only imports
+- Model task outcomes as a discriminated union: `type TaskResult<T> = {status:'idle'} | {status:'running';percent:number} | {status:'done';data:T} | {status:'error';message:string}`
+- Zustand slices: `interface XState { ... } & interface XActions { ... }` — one interface for data, one for mutations
+
+#### Cyclomatic complexity (max 5 branches per function)
+- Guard clauses + early return instead of nested `if` blocks
+- Replace `if/else` chains with `Record<K, V>` lookup tables: `const TASK_BY_REGION = { skull: 'craniofacial_structures', ... } as const`
+- No nested ternaries — extract to named variable or function
+
+#### Cognitive complexity (component max 120 lines, function max 40 lines)
+- Extract sub-components for list items (`<IslandListItem>`, `<AxisSlider>`, `<LabelRow>`)
+- Extract custom hook for any `useEffect`+state pair that exceeds 10 lines
+- Compute all derived values in variables above the `return` — no filter/map/sort inline inside JSX
+- No side effects in render path — all fetching lives in `useEffect` or TanStack Query
+
+#### React patterns
+- `React.memo`: only for components with stable-reference props that re-render frequently (individual R3F meshes, list rows)
+- `useCallback`: only when passed to a `React.memo` child or in a `useEffect` dep array
+- `useMemo`: only for computations measurably >1 ms — not for object/array literals
+- `useRef`: for NiiVue instance, Three.js geometry/material, animation frame IDs
+- Dispose R3F `geometry` + `material` in `useEffect` cleanup. Dispose NiiVue with `nv.dispose()`.
+- No inline arrow functions as props on `React.memo` children — wrap with `useCallback` instead
+- One component per file. No multi-export component files.
+
+#### Accessibility
+- All icon-only buttons: `aria-label` required
+- All sliders: `aria-label`, `aria-valuemin`, `aria-valuemax`, `aria-valuenow`
+- Progress bars: `role="progressbar"`, `aria-valuenow`, `aria-valuemin={0}`, `aria-valuemax={100}`
+- R3F `<Canvas>`: `aria-label="3D [description] viewport"`, `role="img"`
+- Color-coded information always paired with a text label — never color alone
+
+#### Dead code hygiene
+- No `console.log/warn/error` — import from `src/lib/logger.ts` (`logger.debug/info/warn/error`)
+- No commented-out code blocks — use git history
+- No unused imports (ESLint `@typescript-eslint/no-unused-vars` in CI)
 
 ### Python / Backend
 
+#### Domain rules
 - Python 3.11+ syntax — use `match`, `|` union types, `tomllib` etc.
 - FastAPI: use `async def` for I/O routes, sync worker for CPU-bound (via `run_in_executor`)
 - Always use Pydantic v2 models for request/response schemas
@@ -65,6 +109,38 @@ VSP Engine is a virtual surgery planning web platform. It ingests DICOM CT/MR sc
 - **planReportStore**: captures viewport screenshot (`gl.domElement.toDataURL()`), measurement results, surgeon notes, export manifest. "Download Report" → PDF.
 - **Study data TTL**: MinIO lifecycle policy auto-deletes study files after `STUDY_TTL_DAYS` (default 30). Patient data must never persist beyond session.
 - Never log patient PHI; anonymize DICOM tags at ingestion boundary
+
+#### Naming
+- Functions/variables: snake_case. Classes (Pydantic/dataclass): PascalCase. Module constants: SCREAMING_SNAKE_CASE. Private helpers: `_` prefix (`_apply_morphological_close`). Celery task names: `module.action` string (`"scout.run_scout_pass"`).
+
+#### Type strictness
+- `from __future__ import annotations` at the top of every module
+- Complete type hints on all public functions — mypy `strict = true` enforced in CI
+- `TypeAlias` for complex nested types: `IslandList: TypeAlias = list[IslandMeta]`
+- `Protocol` for storage/model interfaces (enables DI and unit testing without real GPU/MinIO)
+- Pydantic v2 response models: `model_config = ConfigDict(frozen=True)`
+
+#### Module boundary rules (enforced by architecture, no exceptions)
+- Routers → Services only. Tasks → Services only.
+- Services must NOT import from routers or Celery tasks.
+- Services must NOT accept FastAPI `Request`/`Response` objects.
+- Routers contain zero business logic — parse request, call service, return response.
+- Celery tasks contain zero business logic — serialize args, call service, update task state.
+
+#### Cyclomatic complexity (max 8 per function — Ruff `mccabe`)
+- Dispatch tables instead of `elif` chains: `_HINT_TO_TASK: dict[str, str] = { ... }` then `.get(hint, 'total')`
+- Guard clauses + early return instead of nested `if` blocks
+
+#### Error handling
+- Typed domain exceptions defined in `app/exceptions.py` (`ScoutFailed`, `SegmentOOM`, `MeshNotWatertight`)
+- FastAPI: one `@app.exception_handler` per exception type → HTTP status — no `raise HTTPException` inside services
+- Celery tasks: always wrap service call with try/except → `self.update_state(state="FAILURE", meta={"error": str(exc), "type": type(exc).__name__})`; then re-raise
+- Never swallow exceptions (`except Exception: pass` forbidden — Ruff `B001`)
+
+#### Logging
+- `logger = logging.getLogger(__name__)` in every module — never `print()`
+- Log levels: DEBUG (mesh stats, voxel counts), INFO (task start/complete), WARNING (scan QC issues), ERROR (task failures)
+- Never log PHI — log `study_id` UUID only
 
 ### Medical Data / Safety
 
