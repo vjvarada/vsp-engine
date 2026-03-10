@@ -1,93 +1,53 @@
-﻿# ============================================================
-# VSP Engine — .gitignore
-# ============================================================
-
-# --- CRITICAL: Never commit patient / medical data ---
-*.dcm
-*.dicom
-data/
-/data/
-studies/
-/studies/
-uploads/
-/uploads/
-**/*.nii
-**/*.nii.gz
-**/*.mha
-**/*.mhd
-**/*.nrrd
-
-# --- AI model weights (very large, download on first run) ---
-models/
-/models/
-*.pth
-*.onnx
-*.pt
-*.safetensors
-.totalsegmentator/
-
-# --- Python ---
+# Dependencies
+node_modules/
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
+*.pyc
+*.pyo
+*.pyd
 .Python
-.venv/
-venv/
-env/
-ENV/
-.env
 *.egg-info/
 dist/
 build/
-.mypy_cache/
-.ruff_cache/
-.pytest_cache/
-htmlcov/
-.coverage
-*.cover
-pip-log.txt
+.venv/
+venv/
+env/
 
-# --- Node / pnpm / Vite build ---
-node_modules/
-dist/
-.pnpm-store/
+# Build outputs
+frontend/dist/
+frontend/.vite/
+
+# Environment
+.env
+!.env.example
+
+# IDE
+.vscode/settings.json
+.idea/
+*.suo
+*.user
+
+# Logs
 *.log
 npm-debug.log*
-pnpm-debug.log*
-.turbo/
 
-# --- Docker ---
-docker-compose.override.yml
-
-# --- IDE ---
-.vscode/settings.json.local
-.idea/
-*.swp
-*.swo
-*.DS_Store
+# OS
+.DS_Store
 Thumbs.db
 
-# --- Environment ---
-.env
-.env.local
-.env.*.local
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
 
-# --- Redis dumps ---
-dump.rdb
+# Docker
+docker/ssl/
 
-# --- MinIO local storage ---
-minio-data/
+# Uploads (patient data / study files)
+backend/uploads/
 
-# --- Celery ---
-celerybeat-schedule
-celerybeat.pid
+# ML model weights (too large for git)
+*.pth
+*.ckpt
+*.pkl
+*.safetensors
 
-# --- Logs ---
-*.log
-logs/
-
-# --- Temp / scratch ---
-tmp/
-temp/
-scratch/

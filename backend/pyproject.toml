@@ -1,0 +1,98 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vsp-engine-backend"
+version = "0.1.0"
+description = "VSP Engine — Virtual Surgery Planning Backend"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.7.0",
+    "celery>=5.4.0",
+    "redis>=5.2.0",
+    "boto3>=1.35.0",          # MinIO / S3
+    "python-multipart>=0.0.20",
+    "python-jose[cryptography]>=3.3.0",
+    "httpx>=0.28.0",
+    "orjson>=3.10.0",
+    "pydicom>=3.0.0",
+    "SimpleITK==2.0.2",
+    "nibabel>=5.3.0",
+    "numpy>=1.26.0",
+    "Pillow>=11.0.0",
+    "sqlalchemy>=2.0.0",
+    "asyncpg>=0.30.0",
+    "alembic>=1.14.0",
+    # GPU/ML — installed in Docker, commented for local dev
+    # "torch<=2.8.0",
+    # "totalsegmentator>=2.4.0",
+    # "meshlib>=25.4.0",
+    # "medim>=0.1.0",         # SAM-Med3D-turbo
+    # "segment-anything>=1.0",  # MedSAM
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "httpx>=0.28.0",
+    "mypy>=1.13.0",
+    "ruff>=0.9.0",
+    "types-redis>=4.6.0",
+    "types-Pillow>=10.2.0",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["app", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "B",        # flake8-bugbear (B001 no bare except)
+    "C90",      # mccabe complexity
+    "UP",       # pyupgrade
+    "N",        # pep8-naming
+    "ANN",      # annotations
+    "S",        # bandit security
+    "RUF",      # ruff-specific
+]
+ignore = ["ANN101", "ANN102", "S101"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 8
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+plugins = ["pydantic.mypy"]
+exclude = ["tests/"]
+
+[[tool.mypy.overrides]]
+module = [
+    "meshlib.*",
+    "totalsegmentator.*",
+    "medim.*",
+    "segment_anything.*",
+    "nibabel.*",
+    "SimpleITK.*",
+    "pydicom.*",
+    "celery.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--cov=app --cov-report=term-missing"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]

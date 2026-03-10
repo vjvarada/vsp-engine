@@ -1,0 +1,141 @@
+﻿@import "tailwindcss";
+@plugin "tailwindcss-animate";
+
+/* 
+   VSP Engine Design Tokens
+   Adapted verbatim from RapidTool-Fixture
+    */
+
+:root {
+  --radius: 0.5rem;
+  --transition-tech: cubic-bezier(0.25, 0.46, 0.45, 0.94);
+}
+
+.dark {
+  /* Core palette */
+  --background: 220 13% 8%;
+  --foreground: 210 20% 90%;
+
+  /* Panels */
+  --card: 220 13% 11%;
+  --card-foreground: 210 20% 90%;
+  --popover: 220 13% 11%;
+  --popover-foreground: 210 20% 90%;
+
+  /* Cyan primary — active step, buttons */
+  --primary: 198 89% 50%;
+  --primary-foreground: 220 13% 8%;
+
+  /* Secondary */
+  --secondary: 220 13% 16%;
+  --secondary-foreground: 210 20% 80%;
+
+  /* Muted */
+  --muted: 220 13% 14%;
+  --muted-foreground: 210 15% 55%;
+
+  /* Orange accent — warnings, skipped steps */
+  --accent: 27 96% 61%;
+  --accent-foreground: 220 13% 8%;
+
+  /* Destructive */
+  --destructive: 0 84% 60%;
+  --destructive-foreground: 210 20% 98%;
+
+  /* Borders & inputs */
+  --border: 220 13% 18%;
+  --input: 220 13% 16%;
+  --ring: 198 89% 50%;
+}
+
+/* 
+   Utility Classes (RapidTool-Fixture carry-over)
+    */
+
+.tech-glass {
+  backdrop-filter: blur(8px);
+  background: hsl(var(--background) / 0.85);
+  border: 1px solid hsl(var(--border) / 0.5);
+}
+
+.font-tech {
+  font-family: "RealityHyper", "JetBrains Mono", monospace;
+  letter-spacing: 0.02em;
+}
+
+.tech-transition {
+  transition: all 0.3s var(--transition-tech);
+}
+
+/* 
+   Base Styles
+    */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: hsl(var(--background));
+}
+
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--border));
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--muted-foreground));
+}
+
+/* NiiVue canvas container */
+.niivue-container {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.niivue-container canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+/* R3F Canvas overlay */
+.r3f-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.r3f-overlay canvas {
+  pointer-events: auto;
+}
